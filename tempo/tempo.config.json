@@ -1,0 +1,14 @@
+{
+  "paths": {
+    "canvases": "./designs"
+  },
+  "scripts": {
+    "install": "npm install",
+    "start": "npm run dev"
+  },
+  "apps": [
+    {
+      "start": "npm exec -- vite --port=${APP_PORT} --strictPort"
+    }
+  ]
+}

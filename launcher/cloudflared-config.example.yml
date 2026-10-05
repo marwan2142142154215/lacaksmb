@@ -1,0 +1,11 @@
+# Copy to .tools/cloudflared/config.yml after creating a named Cloudflare Tunnel.
+# Keep the tunnel credentials JSON beside config.yml; never commit that JSON.
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: C:\\REPLACE_WITH_PROJECT_PATH\\.tools\\cloudflared\\REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: fleet.REPLACE_WITH_YOUR_DOMAIN
+    service: https://192.168.100.118:8787
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
