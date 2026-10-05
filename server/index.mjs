@@ -121,7 +121,15 @@ const server = https.createServer({
   passphrase: pfxPassphrase,
 }, (request, response) => {
   const origin = request.headers.origin || "";
-  const allowedOrigins = new Set(["https://localhost", "capacitor://localhost", "http://localhost:5173", "http://127.0.0.1:5173"]);
+  const allowedOrigins = new Set([
+    "https://localhost",
+    "capacitor://localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://lacaksmb.marwanyahabibi.workers.dev",
+    "https://lacaksmbbot.com",
+    "https://www.lacaksmbbot.com",
+  ]);
   if (allowedOrigins.has(origin)) {
     response.setHeader("access-control-allow-origin", origin);
     response.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
@@ -428,12 +436,20 @@ async function flushSupabase() {
   supabaseFlushActive = true;
   for (const [queue, rows] of pending) for (const row of rows) queue.delete(row.device_id || row.id);
   try {
-    await Promise.all(pending.map(([, rows, table, conflict]) => fetch(`${supabaseUrl}/rest/v1/${table}?on_conflict=${conflict}`, {
+    // fleet_device_state and fleet_commands both reference fleet_devices via
+    // foreign key, so the parent table has to land first. Flushing all three
+    // in parallel makes PostgREST return 409 for the children whenever they
+    // arrive ahead of their device row.
+    const upload = ([, rows, table, conflict]) => fetch(`${supabaseUrl}/rest/v1/${table}?on_conflict=${conflict}`, {
       method: "POST",
       headers: { apikey: supabaseServiceKey, authorization: `Bearer ${supabaseServiceKey}`, "content-type": "application/json", Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(rows),
       signal: AbortSignal.timeout(10_000),
-    }).then((response) => { if (!response.ok) throw new Error(`Supabase ${table} upsert returned HTTP ${response.status}`); })));
+    }).then((response) => { if (!response.ok) throw new Error(`Supabase ${table} upsert returned HTTP ${response.status}`); });
+    const parents = pending.filter(([, , table]) => table === "fleet_devices");
+    const children = pending.filter(([, , table]) => table !== "fleet_devices");
+    await Promise.all(parents.map(upload));
+    await Promise.all(children.map(upload));
     supabaseRetryDelay = 1000;
     supabaseRetryAt = 0;
   } catch (error) {

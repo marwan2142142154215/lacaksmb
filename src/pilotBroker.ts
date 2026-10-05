@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-const BROKER_URL = import.meta.env.VITE_BROKER_URL || "wss://192.168.100.118:8787/ws";
+const BROKER_URL = import.meta.env.VITE_BROKER_URL || "wss://broker.lacaksmbbot.com/ws";
 
 export type PilotTelemetry = {
   deviceId: string;
@@ -33,6 +33,7 @@ export function usePilotBroker(
   role: BrokerRole,
   deviceId: string,
   onCommand?: (command: BrokerCommand) => Promise<{ ok: boolean; detail?: string }>,
+  tokenOverride?: string,
 ) {
   const socket = useRef<WebSocket | null>(null);
   const retryTimer = useRef<number | undefined>(undefined);
@@ -46,7 +47,9 @@ export function usePilotBroker(
 
   useEffect(() => {
     let disposed = false;
-    const token = import.meta.env.VITE_DEVICE_TOKEN;
+    // The dashboard passes a runtime token; the APK builds fall back to the
+    // bundled VITE_DEVICE_TOKEN because the token ships inside the APK itself.
+    const token = tokenOverride || import.meta.env.VITE_DEVICE_TOKEN;
     if (!token) {
       setConnected(false);
       return;
@@ -100,7 +103,7 @@ export function usePilotBroker(
       socket.current?.close();
       socket.current = null;
     };
-  }, [deviceId, role]);
+  }, [deviceId, role, tokenOverride]);
 
   const send = useCallback((message: Record<string, unknown>) => {
     const current = socket.current;

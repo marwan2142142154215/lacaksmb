@@ -8,6 +8,7 @@ dist/
 dist-ssr/
 *.local
 artifacts/*.apk
+artifacts/*.zip
 android/.gradle/
 android/local.properties
 android/**/build/

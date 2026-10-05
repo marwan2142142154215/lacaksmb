@@ -63,6 +63,40 @@ type DevicePolicyPlugin = {
 export const devicePolicy = registerPlugin<DevicePolicyPlugin>("DevicePolicy");
 
 export const brokerConfig = {
-  url: import.meta.env.VITE_BROKER_URL || "wss://192.168.100.118:8787/ws",
+  url: import.meta.env.VITE_BROKER_URL || "wss://broker.lacaksmbbot.com/ws",
   token: import.meta.env.VITE_DEVICE_TOKEN || "",
 };
+
+// VITE_DEVICE_TOKEN compiles into the JS bundle, which is fine for the APK
+// builds (an APK is not a public web asset) but must never be used for the
+// web dashboard: anyone loading the page could read the master token from
+// devtools. The dashboard therefore takes its token at runtime from
+// sessionStorage, so it leaves no trace in the bundle or source maps.
+const ADMIN_TOKEN_KEY = "smb.admin.token";
+const ADMIN_TOKEN_EVENT = "smb:admin-token";
+
+export function readAdminToken(): string {
+  if (typeof window === "undefined") return "";
+  try { return window.sessionStorage.getItem(ADMIN_TOKEN_KEY) || ""; } catch { return ""; }
+}
+
+function writeAdminToken(value: string) {
+  if (typeof window === "undefined") return;
+  const trimmed = value.trim();
+  try {
+    if (trimmed) window.sessionStorage.setItem(ADMIN_TOKEN_KEY, trimmed);
+    else window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  } catch {
+    // Private-mode browsers can refuse sessionStorage; the gate then simply
+    // stays closed and the operator retries in a normal window.
+  }
+  window.dispatchEvent(new Event(ADMIN_TOKEN_EVENT));
+}
+
+export function saveAdminToken(value: string) {
+  writeAdminToken(value);
+}
+
+export function clearAdminToken() {
+  writeAdminToken("");
+}

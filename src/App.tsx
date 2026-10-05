@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import {
   Activity, AlertTriangle, ArrowUpRight, Battery, Bluetooth, Bot, Check, ChevronRight,
   CircleAlert, Clock3, Command, EyeOff, LayoutDashboard, ListChecks, LockKeyhole,
@@ -6,7 +6,7 @@ import {
   Settings2, ShieldCheck, Smartphone, UnlockKeyhole, Wifi, X,
 } from "lucide-react";
 import TrackerPage from "./TrackerPage";
-import { brokerConfig, proximityBle } from "./proximityBle";
+import { brokerConfig, clearAdminToken, proximityBle, readAdminToken, saveAdminToken } from "./proximityBle";
 import { usePilotBroker, type PilotTelemetry } from "./pilotBroker";
 import "./MasterConsole.css";
 
@@ -40,11 +40,74 @@ const pageTitles: Record<Page, { title: string; description: string }> = {
 
 function App() {
   if (import.meta.env.MODE === "tracker") return <TrackerPage />;
-  return <MasterConsole />;
+  return <MasterConsoleGate />;
 }
 
-function MasterConsole() {
-  const broker = usePilotBroker("master", MASTER_ID);
+const ADMIN_TOKEN_EVENT = "smb:admin-token";
+
+/** Keeps the gate in sync with sessionStorage without a page reload. */
+function useAdminToken() {
+  const [token, setToken] = useState(readAdminToken);
+  useEffect(() => {
+    const sync = () => setToken(readAdminToken());
+    window.addEventListener(ADMIN_TOKEN_EVENT, sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener(ADMIN_TOKEN_EVENT, sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  return token;
+}
+
+function MasterConsoleGate() {
+  const token = useAdminToken();
+  if (!token) return <AdminGate />;
+  return <MasterConsole token={token} />;
+}
+
+function AdminGate() {
+  const [value, setValue] = useState("");
+  const [error, setError] = useState("");
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (!value.trim()) { setError("Token admin wajib diisi."); return; }
+    saveAdminToken(value);
+    setValue("");
+    setError("");
+  };
+  return (
+    <div className="smb-gate">
+      <form className="smb-gate-card" onSubmit={submit}>
+        <div className="smb-gate-icon"><ShieldCheck size={22} /></div>
+        <h1>Masuk konsol SMB</h1>
+        <p>
+          Token admin broker disimpan di <code>sessionStorage</code> tab ini saja,
+          bukan di dalam bundle. Kalau token ditolak, hapus cookie dan muat ulang.
+        </p>
+        <label htmlFor="smb-admin-token">Token admin</label>
+        <input
+          id="smb-admin-token"
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          value={value}
+          onChange={(event) => { setValue(event.target.value); setError(""); }}
+          placeholder="FLEET_MASTER_TOKEN"
+        />
+        {error && <small className="smb-gate-error">{error}</small>}
+        <button type="submit">Buka konsol</button>
+        <small className="smb-gate-foot">
+          Akses publik dilindungi Cloudflare Access. Jangan pernah menempelkan token
+          ini ke dalam kode atau repository.
+        </small>
+      </form>
+    </div>
+  );
+}
+
+function MasterConsole({ token }: { token: string }) {
+  const broker = usePilotBroker("master", MASTER_ID, undefined, token);
   const [page, setPage] = useState<Page>("overview");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [search, setSearch] = useState("");
@@ -66,8 +129,14 @@ function MasterConsole() {
     let active = true;
     const refresh = async () => {
       try {
-        const response = await fetch(`${apiBase}/api/admin/snapshot`, { headers: { Authorization: `Bearer ${brokerConfig.token}` }, cache: "no-store" });
-        if (!response.ok) throw new Error(response.status === 401 ? "Autentikasi dashboard ditolak broker." : `Broker HTTP ${response.status}`);
+        const response = await fetch(`${apiBase}/api/admin/snapshot`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+        if (response.status === 401) {
+          // Drop the rejected token so the gate reappears instead of looping
+          // on a 401 every five seconds.
+          if (active) { clearAdminToken(); setNotice("Token admin ditolak broker."); }
+          return;
+        }
+        if (!response.ok) throw new Error(`Broker HTTP ${response.status}`);
         const data = await response.json() as Snapshot;
         if (active) { setSnapshot(data); setRefreshAt(data.generatedAt); setNotice(""); }
       } catch (error) {
@@ -77,7 +146,7 @@ function MasterConsole() {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5000);
     return () => { active = false; window.clearInterval(timer); };
-  }, [apiBase]);
+  }, [apiBase, token]);
 
   useEffect(() => {
     let mounted = true;

@@ -1,11 +1,32 @@
-# Copy to .tools/cloudflared/config.yml after creating a named Cloudflare Tunnel.
-# Keep the tunnel credentials JSON beside config.yml; never commit that JSON.
-tunnel: REPLACE_WITH_TUNNEL_UUID
-credentials-file: C:\\REPLACE_WITH_PROJECT_PATH\\.tools\\cloudflared\\REPLACE_WITH_TUNNEL_UUID.json
+# Contoh konfigurasi named Cloudflare Tunnel untuk broker SMB Fleet.
+#
+# Salin ke .tools/cloudflared/config.yml lalu isi tunnel + credentials-file.
+#
+# Catatan format Tunnel ID:
+#   Tunnel yang dibuat cloudflared versi baru memakai ID berformat UUID,
+#   contoh "016877bc-4115-4700-9e16-0ad256e82d64". Format base64 panjang
+#   ("eyJhIjoi...") hanya dipakai oleh tunnel versi legacy. Keduanya sama-sama
+#   valid untuk baris "tunnel:" di bawah.
+#
+# JANGAN pernah menempelkan <TUNNEL_ID>.json ke chat, repository, atau issue.
+# File itu memuat private key tunnel yang membuat siapa pun bisa menyamar
+# sebagai connector milikmu. Folder .tools/ sudah tertutup .gitignore.
+#
+# Catatan arsitektur untuk setup yang sudah berjalan:
+#   Tunnel LACAKSMB aktif sebagai Windows Service "Cloudflared" dengan
+#   mode remotely-managed (tunnel run --token-file). Pada mode itu ingress
+#   rule diambil dari dashboard Cloudflare, bukan dari file ini, sehingga
+#   file ini hanya perlu sebagai fallback untuk menjalankan tunnel manual.
+
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: C:\REPLACE_WITH_PROJECT_PATH\.tools\cloudflared\REPLACE_WITH_TUNNEL_ID.json
 
 ingress:
-  - hostname: fleet.REPLACE_WITH_YOUR_DOMAIN
-    service: https://192.168.100.118:8787
+  # Hostname publik di zone lacaksmbbot.com, diarahkan ke broker HTTPS lokal.
+  - hostname: broker.lacaksmbbot.com
+    service: https://127.0.0.1:8787
     originRequest:
+      # Wajib: broker memakai sertifikat self-signed dari .tools/broker-cert,
+      # jadi verifikasi rantai sertifikat akan gagal tanpa ini.
       noTLSVerify: true
   - service: http_status:404
