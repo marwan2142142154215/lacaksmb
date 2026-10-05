@@ -1,0 +1,40 @@
+{
+  "name": "nusa-fleet-console",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "android:sync": "npm run build && cap sync android",
+    "android:build": "npm run build && cap sync android && cd android && .\\gradlew.bat assembleDebug",
+    "android:build:tracker": "tsc -b && vite build --mode tracker && cap sync android && cd android && .\\gradlew.bat assembleTrackerDebug",
+    "android:build:master-live": "tsc -b && vite build --mode master-live && cap sync android && cd android && .\\gradlew.bat assembleMasterDebug",
+    "server:pilot": "node server/index.mjs",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "format": "prettier --write src/App.tsx src/App.css src/index.css vite.config.ts index.html"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.2",
+    "@capacitor/core": "^8.5.2",
+    "lucide-react": "^1.52.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tempo-sdk": "^0.0.51",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.2",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "prettier": "^3.9.9",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0"
+  }
+}
