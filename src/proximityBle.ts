@@ -62,16 +62,15 @@ type DevicePolicyPlugin = {
 
 export const devicePolicy = registerPlugin<DevicePolicyPlugin>("DevicePolicy");
 
+const trackerBuildToken = import.meta.env.MODE === "tracker" ? import.meta.env.VITE_DEVICE_TOKEN || "" : "";
+
 export const brokerConfig = {
   url: import.meta.env.VITE_BROKER_URL || "wss://broker.lacaksmbbot.com/ws",
-  token: import.meta.env.VITE_DEVICE_TOKEN || "",
+  token: trackerBuildToken,
 };
 
-// VITE_DEVICE_TOKEN compiles into the JS bundle, which is fine for the APK
-// builds (an APK is not a public web asset) but must never be used for the
-// web dashboard: anyone loading the page could read the master token from
-// devtools. The dashboard therefore takes its token at runtime from
-// sessionStorage, so it leaves no trace in the bundle or source maps.
+// The tracker build may include its own device credential. Master builds and
+// the web dashboard authenticate with short-lived runtime admin sessions.
 const ADMIN_TOKEN_KEY = "smb.admin.token";
 const ADMIN_USER_KEY = "smb.admin.user";
 const ADMIN_TOKEN_EVENT = "smb:admin-token";

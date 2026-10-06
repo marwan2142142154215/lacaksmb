@@ -28,6 +28,7 @@ export type BrokerCommand = {
 
 type BrokerRole = "master" | "tracker";
 type BrokerPacket = Record<string, unknown> & { type?: string };
+const trackerBuildToken = import.meta.env.MODE === "tracker" ? import.meta.env.VITE_DEVICE_TOKEN : "";
 
 export function usePilotBroker(
   role: BrokerRole,
@@ -47,9 +48,9 @@ export function usePilotBroker(
 
   useEffect(() => {
     let disposed = false;
-    // The dashboard passes a runtime token; the APK builds fall back to the
-    // bundled VITE_DEVICE_TOKEN because the token ships inside the APK itself.
-    const token = tokenOverride || import.meta.env.VITE_DEVICE_TOKEN;
+    // Master builds authenticate with a short-lived admin session. Only the
+    // dedicated tracker build embeds its per-device token.
+    const token = tokenOverride || (role === "tracker" ? trackerBuildToken : "");
     if (!token) {
       setConnected(false);
       return;
