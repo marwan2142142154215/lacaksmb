@@ -1,32 +1,45 @@
-# React + TypeScript + Vite
+# SMB Lacak — Fleet Tracking
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Aplikasi pelacak armada (SMB): dashboard web, broker WebSocket, dan APK Android
+tracker/master yang dipasang di HP armada.
 
-Currently, two official plugins are available:
+## Teknologi
+- Node.js 24 (LTS)
+- Express-kin https custom broker (`server/index.mjs`)
+- React 19
+- Tailwind CSS 4
+- Vite 8
+- SQLite (better via `node:sqlite`)
+- Capacitor Android 8
+- Cloudflare Tunnel & Worker static hosting
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Library utama
+- react / react-dom   : UI tracker & dashboard
+- tailwindcss         : styling
+- zustand / dsb       : state (mengikuti pembakuan perlahan)
+- ws                  : WebSocket broker
+- qrcode              : QR admin enrolment
+- capacitor           : APK Android
 
-## React Compiler
+## Cara menjalankan di local
+1. `npm install`
+2. salin `.env.example` menjadi `.env.local`, lalu isi pengaturannya
+3. `npm run dev` (nilai default vite dev pada port 51355)
+4. `npm run server:pilot` (menjalankan broker lokal) bila diperlukan
+5. Untuk APK: `npm run android:build:tracker`
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Penanggung jawab
+- Tim            : Pengembang SMB Lacak
+- Developer      : Marwan
+- Divisi pengguna: Operasional / IT
 
-## Expanding the Oxlint configuration
+## Tautan terkait
+- Dokumen analisa : binis-flow/catalog (pending)
+- Alamat staging  : broker.lacaksmbbot.com (penugasan fasilitator)
+- Alamat production: broker.lacaksmbbot.com
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
-```
-
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Standar mutu proyek
+Standar Pengembangan Sistem perusahaan diberlakukan pada repo ini:
+- `.editorconfig`  : indentasi 4 spasi
+- `.prettierrc.json` & `.vscode` : format otomatis
+- Hanya `main` yang boleh di-deploy; perubahan masuk lewat branch `feature/...` atau `fix/...`

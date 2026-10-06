@@ -3,6 +3,8 @@ tempo/node_modules/
 tempo/dist/
 node_modules/
 .tools/
+vendor/
+.env
 /data/
 dist/
 dist-ssr/
@@ -15,5 +17,6 @@ android/**/build/
 *.log
 .vscode/*
 !.vscode/extensions.json
+!.vscode/settings.json
 .idea/
 .DS_Store
