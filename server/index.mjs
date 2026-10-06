@@ -959,6 +959,8 @@ const server = https.createServer({
       const batteryLevel = Number.isInteger(payload.batteryLevel) && payload.batteryLevel >= 0 && payload.batteryLevel <= 100 ? payload.batteryLevel : null;
       const location = validatedLocation(payload);
       const wifiSsid = normalizeSsid(payload.wifiSsid);
+      const wasOffline = device.connected !== true;
+      if (wasOffline) { device.connected = true; persistDeviceConnection(deviceId, true); publishDevices(); }
       const telemetry = setTelemetry(deviceId, {
         detected,
         rssi: detected ? rssi : null,
