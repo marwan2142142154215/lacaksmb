@@ -3,6 +3,10 @@
   "name": "lacaksmb",
   "compatibility_date": "2026-10-06",
   "workers_dev": true,
+  "routes": [
+    { "pattern": "lacaksmbbot.com", "custom_domain": true },
+    { "pattern": "www.lacaksmbbot.com", "custom_domain": true }
+  ],
   "assets": {
     "directory": "./dist"
   }
