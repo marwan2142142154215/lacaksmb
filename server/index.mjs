@@ -70,10 +70,10 @@ const certPath = path.join(root, ".tools", "broker-cert", "broker-cert.pem");
 const pfxPath = path.join(root, ".tools", "broker-cert", "broker.p12");
 const pfxPassphrase = process.env.FLEET_TLS_PASSPHRASE || "";
 
-// Identitas perangkat tetap. Tracker lain didaftarkan lewat kode enrolmen site,
-// jadi hanya kedua ID ini yang dibuat otomatis saat broker pertama kali start.
-const MASTER_ID = "R9RY506354P";
-const TRACKER_ID = "R9RXC03EC9N";
+// Master/tracker IDs tidak lagi di-hardcode.
+// Semua perangkat (master dan tracker) mendaftar lewat enrollment code.
+// FLEET_MASTER_ID di .env.local opsional – backward-compat saja.
+const FLEET_MASTER_ID = process.env.FLEET_MASTER_ID || null;
 // "photo"/"photo_front" hanya dijalankan saat admin memintanya; tidak ada
 // pengambilan foto berkala di sisi mana pun.
 const ALLOWED_COMMANDS = new Set(["lock", "unlock", "uninstall", "photo", "photo_front"]);
@@ -112,10 +112,8 @@ if (!fs.existsSync(pfxPath) || !fs.existsSync(certPath) || !pfxPassphrase) {
   throw new Error("Local WSS certificate is missing. Generate the local broker certificate before starting the broker.");
 }
 
-const devices = new Map([
-  [MASTER_ID, { role: "master", name: "SMB Master", connected: false, siteId: null }],
-  [TRACKER_ID, { role: "tracker", name: "SMB Lacak", connected: false, siteId: null }],
-]);
+// Perangkat dimuat dari database saat startup; tidak ada entry hardcoded.
+const devices = new Map();
 const registryPath = path.join(root, "data", "fleet-registry.json");
 if (fs.existsSync(registryPath)) {
   try {
@@ -127,10 +125,8 @@ if (fs.existsSync(registryPath)) {
     console.error("Fleet registry could not be loaded:", error.message);
   }
 }
-const tokens = new Map([
-  [MASTER_ID, masterToken],
-  [TRACKER_ID, trackerToken],
-]);
+// Token map: masterToken berlaku untuk semua master, trackerToken untuk semua tracker.
+const tokens = new Map();
 const sockets = new Map();
 const queues = new Map();
 const commands = new Map();
@@ -187,11 +183,10 @@ for (const [deviceId, device] of devices) {
   queueSupabaseDevice(deviceId);
   queueSupabaseState(deviceId);
 }
-// Muat ulang semua perangkat dari database, termasuk tracker hasil enrolmen site.
+// Muat semua perangkat dari database (master dan tracker).
 for (const row of database.prepare("SELECT device_id,name,role FROM devices").all()) {
   if (devices.has(row.device_id)) { devices.get(row.device_id).name = row.name; continue; }
-  if (row.role !== "tracker") continue;
-  devices.set(row.device_id, { role: "tracker", name: row.name, connected: false, siteId: null, uninstallBlocked: false });
+  devices.set(row.device_id, { role: row.role, name: row.name, connected: false, siteId: null, uninstallBlocked: false });
 }
 
 // ── Site / tim ──────────────────────────────────────────────────────────────────
@@ -241,7 +236,7 @@ for (const row of [...recentRows.reverse(), ...pendingRows]) {
 // Status tracker disimpan per perangkat karena satu broker melayani banyak HP.
 const telemetryByDevice = new Map();
 function emptyTelemetry(deviceId) {
-  return { deviceId, masterId: MASTER_ID, detected: false, rssi: null, receivedAt: null, online: false };
+  return { deviceId, detected: false, rssi: null, receivedAt: null, online: false };
 }
 function telemetryFor(deviceId) {
   if (!telemetryByDevice.has(deviceId)) telemetryByDevice.set(deviceId, emptyTelemetry(deviceId));
@@ -313,11 +308,19 @@ async function readJsonRequest(request, maxBytes = 16_384) {
   }
 }
 
-/** Autentikasi token perangkat: paket env untuk device bawaan, hash untuk hasil enrolmen. */
+/** Autentikasi token perangkat:
+ *  1. Master: token cocok dengan FLEET_MASTER_TOKEN env var
+ *  2. Tracker: token cocok dengan FLEET_TRACKER_TOKEN env var (device lama pre-enrolmen)
+ *  3. Semua perangkat: token_hash dari DB (hasil enrolmen)
+ */
 function authenticateDevice(deviceId, token) {
   if (!deviceId || !token) return false;
-  const configured = tokens.get(deviceId);
-  if (configured && configured === token) return true;
+  const device = devices.get(deviceId);
+  if (!device) return false;
+  // Cek token berbasis role (env var)
+  if (device.role === "master" && masterToken && token === masterToken) return true;
+  if (device.role === "tracker" && trackerToken && token === trackerToken) return true;
+  // Cek token_hash dari DB (hasil enrollment)
   const row = database.prepare("SELECT token_hash FROM devices WHERE device_id=?").get(deviceId);
   return Boolean(row?.token_hash) && row.token_hash === tokenDigest(token);
 }
@@ -832,7 +835,7 @@ const server = https.createServer({
     if (request.url === "/api/admin/snapshot") {
       const url = new URL(request.url, `https://${request.headers.host || "localhost"}`);
       const trackerIds = [...devices.entries()].filter(([, device]) => device.role === "tracker").map(([deviceId]) => deviceId);
-      const historyDeviceId = trackerIds.includes(url.searchParams.get("deviceId") || "") ? url.searchParams.get("deviceId") : (trackerIds.includes(TRACKER_ID) ? TRACKER_ID : trackerIds[0]);
+      const historyDeviceId = trackerIds.includes(url.searchParams.get("deviceId") || "") ? url.searchParams.get("deviceId") : trackerIds[0];
       const rows = database.prepare("SELECT * FROM command_log ORDER BY created_at DESC LIMIT 30").all().map(publicCommandRow);
       const signalHistory = historyDeviceId ? database.prepare("SELECT minute_at AS minuteAt,sample_count AS sampleCount,detected_count AS detectedCount,CASE WHEN rssi_count=0 THEN NULL ELSE CAST(rssi_sum AS REAL)/rssi_count END AS rssiAvg,rssi_min AS rssiMin,rssi_max AS rssiMax,battery_level AS batteryLevel FROM telemetry_minute WHERE device_id=? ORDER BY minute_at DESC LIMIT 60").all(historyDeviceId).reverse() : [];
       const locationHistory = historyDeviceId ? database.prepare("SELECT * FROM location_history WHERE device_id=? ORDER BY captured_at DESC LIMIT 100").all(historyDeviceId).map(decryptLocationRow).reverse() : [];
@@ -878,7 +881,6 @@ const server = https.createServer({
       const location = validatedLocation(payload);
       const wifiSsid = normalizeSsid(payload.wifiSsid);
       const telemetry = setTelemetry(deviceId, {
-        masterId: MASTER_ID,
         detected,
         rssi: detected ? rssi : null,
         deviceOwner: payload.deviceOwner === true,
@@ -967,8 +969,20 @@ const adminSockets = new Set();
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url || "/", `https://${request.headers.host || "localhost"}`);
   const deviceId = url.searchParams.get("deviceId") || "";
-  const device = devices.get(deviceId);
+  let device = devices.get(deviceId);
   const token = url.searchParams.get("token") || "";
+
+  // Auto-register master jika belum ada di DB tapi tokennya valid (masterToken dari env)
+  if (!device && masterToken && token === masterToken && /^[A-Za-z0-9_-]{4,64}$/.test(deviceId)) {
+    const now = new Date().toISOString();
+    database.prepare("INSERT INTO devices (device_id,name,role,created_at,updated_at) VALUES (?,?,'master',?,?) ON CONFLICT(device_id) DO NOTHING")
+      .run(deviceId, "SMB Master", now, now);
+    database.prepare("INSERT OR IGNORE INTO device_state (device_id,connected,updated_at) VALUES (?,0,?)").run(deviceId, now);
+    device = { role: "master", name: "SMB Master", connected: false, siteId: null, uninstallBlocked: false };
+    devices.set(deviceId, device);
+    console.log(`Master device ${deviceId} auto-registered on first connect.`);
+  }
+
   const adminSession = device?.role === "master" && token !== masterToken
     ? resolveAdminSession(database, token)
     : null;
@@ -1010,7 +1024,6 @@ webSockets.on("connection", (webSocket) => {
       const rssi = Number.isInteger(message.rssi) && message.rssi >= -127 && message.rssi <= 20 ? message.rssi : null;
       const wifiSsid = normalizeSsid(message.wifiSsid);
       const telemetry = setTelemetry(webSocket.deviceId, {
-        masterId: MASTER_ID,
         detected,
         rssi: detected ? rssi : null,
         receivedAt: new Date().toISOString(),
@@ -1073,7 +1086,10 @@ function send(webSocket, packet) {
 }
 function broadcast(packet, deviceId) { send(sockets.get(deviceId), packet); }
 function sendToMasters(packet) {
-  send(sockets.get(MASTER_ID), packet);
+  // Kirim ke SEMUA perangkat master yang terhubung (bukan cuma satu)
+  for (const [deviceId, socket] of sockets) {
+    if (devices.get(deviceId)?.role === "master") send(socket, packet);
+  }
   for (const client of adminSockets) send(client, packet);
 }
 function sendTelemetrySnapshot(webSocket) {
