@@ -78,11 +78,10 @@ type BrokerRole = "master" | "tracker";
 type BrokerPacket = Record<string, unknown> & { type?: string };
 const trackerBuildToken = import.meta.env.MODE === "tracker" ? import.meta.env.VITE_DEVICE_TOKEN || "" : "";
 
-/** URL broker yang dicoba berurutan: LAN dulu bila tersedia (HP tanpa internet), lalu publik. */
+/** URL broker yang dicoba berurutan: publik dulu (sertifikat TLS valid), baru LAN sebagai fallback saat bangun bermasalah. */
 export function brokerCandidates(lanBrokerUrl?: string | null): string[] {
-  const list: string[] = [];
-  if (lanBrokerUrl && lanBrokerUrl.startsWith("wss://")) list.push(lanBrokerUrl);
-  list.push(PUBLIC_BROKER_URL);
+  const list: string[] = [PUBLIC_BROKER_URL];
+  if (lanBrokerUrl && lanBrokerUrl.startsWith("wss://") && lanBrokerUrl !== PUBLIC_BROKER_URL) list.push(lanBrokerUrl);
   return [...new Set(list)];
 }
 
