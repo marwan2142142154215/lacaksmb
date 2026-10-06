@@ -762,20 +762,7 @@ const server = https.createServer({
     const device = devices.get(deviceId);
     if (!device) { respondJson(response, 404, { error: "device_not_found", message: "Perangkat tidak ditemukan." }); return; }
     if (device.role !== "tracker") { respondJson(response, 400, { error: "not_tracker", message: "Hanya perangkat tracker yang bisa dihapus dari daftar." }); return; }
-    sockets.get(deviceId)?.close(4001, "Device removed by admin");
-    sockets.delete(deviceId);
-    queues.delete(deviceId);
-    telemetryByDevice.delete(deviceId);
-    wifiViolationNotifiedAt.delete(deviceId);
-    // FK device_state/command_log/telemetry_minute tidak punya ON DELETE CASCADE,
-    // jadi anaknya dihapus lebih dulu supaya penghapusan tidak ditolak SQLite.
-    database.prepare("DELETE FROM telemetry_minute WHERE device_id=?").run(deviceId);
-    database.prepare("DELETE FROM command_log WHERE device_id=?").run(deviceId);
-    database.prepare("DELETE FROM location_history WHERE device_id=?").run(deviceId);
-    database.prepare("DELETE FROM device_state WHERE device_id=?").run(deviceId);
-    database.prepare("DELETE FROM devices WHERE device_id=?").run(deviceId);
-    devices.delete(deviceId);
-    queueSupabaseDevice(deviceId);
+    purgeDevice(deviceId);
     publishDevices();
     respondJson(response, 200, { ok: true, message: `Perangkat ${device.name} (${deviceId}) dihapus. Enrolmen baru diperlukan untuk memakainya lagi.` });
     return;
@@ -1140,6 +1127,30 @@ function setUninstallBlockedState(deviceId, blocked) {
   publishDevices();
 }
 
+/**
+ * Hapus total satu perangkat tracker (socket, antrean, telemetri, dan semua baris
+ * DB-nya). Dipakai oleh endpoint DELETE admin DAN oleh auto-hapus setelah perintah
+ * uninstall dikonfirmasi di HP, supaya "hapus app" juga melenyapkan perangkat dari
+ * web admin dan master. FK anak tidak ON DELETE CASCADE, jadi dihapus lebih dulu.
+ */
+function purgeDevice(deviceId) {
+  const device = devices.get(deviceId);
+  if (!device) return null;
+  sockets.get(deviceId)?.close(4001, "Device removed");
+  sockets.delete(deviceId);
+  queues.delete(deviceId);
+  telemetryByDevice.delete(deviceId);
+  wifiViolationNotifiedAt.delete(deviceId);
+  database.prepare("DELETE FROM telemetry_minute WHERE device_id=?").run(deviceId);
+  database.prepare("DELETE FROM command_log WHERE device_id=?").run(deviceId);
+  database.prepare("DELETE FROM location_history WHERE device_id=?").run(deviceId);
+  database.prepare("DELETE FROM device_state WHERE device_id=?").run(deviceId);
+  database.prepare("DELETE FROM devices WHERE device_id=?").run(deviceId);
+  devices.delete(deviceId);
+  queueSupabaseDevice(deviceId);
+  return device;
+}
+
 function persistDeviceNames() {
   fs.mkdirSync(path.dirname(registryPath), { recursive: true });
   const names = Object.fromEntries([...devices.entries()].map(([id, device]) => [id, device.name]));
@@ -1387,6 +1398,15 @@ function acknowledge(commandId, ok, detail, sourceDeviceId, reportedLockTaskMode
   queues.set(entry.deviceId, queue.filter((queued) => queued.id !== commandId));
   sendToMasters({ type: "commandUpdate", command: entry });
   drainQueue(entry.deviceId);
+  // "Hapus app" (1 konfirmasi): setelah HP membuka layar hapus & meng-ACK sukses,
+  // perangkat dilenyapkan dari daftar web admin + master sesuai permintaan admin.
+  if (ok && entry.command === "uninstall") {
+    const removed = purgeDevice(entry.deviceId);
+    if (removed) {
+      publishDevices();
+      console.log(`Device ${entry.deviceId} auto-removed from fleet after uninstall confirmation.`);
+    }
+  }
 }
 
 function normalizeName(value) { return String(value || "").trim().toLocaleLowerCase("id-ID"); }

@@ -476,12 +476,10 @@ public class ProximityForegroundService extends Service {
     // ── Notifikasi ───────────────────────────────────────────────────────────────
 
     /**
-     * Notifikasi foreground:
-     * - Mode TRACKER → IMPORTANCE_MIN (tersembunyi dari status bar, tidak ada suara)
-     * - Mode MASTER/BEACON → IMPORTANCE_LOW (terlihat tapi tidak bersuara)
-     *
-     * Dengan IMPORTANCE_MIN, notifikasi tidak muncul di status bar secara default —
-     * hanya terlihat jika pengguna menarik notification shade dan menggulir ke bawah.
+     * Notifikasi foreground (WAJIB terlihat — perangkat terkelola, bukan mata-mata):
+     * - Satu channel IMPORTANCE_LOW: tampil di status bar, tanpa suara/getar.
+     * - Judul & teks menyebut identitas aplikasi dan bahwa perangkat dilacak
+     *   oleh pemiliknya, sehingga pemegang HP selalu tahu perangkat dikelola.
      */
     private Notification buildNotification() {
         Intent open = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
@@ -493,9 +491,12 @@ public class ProximityForegroundService extends Service {
 
         boolean isTracker = "scan".equals(mode);
 
-        // Untuk mode tracker: label generik agar tidak mencolok
-        String title = isTracker ? "Layanan sistem" : "SMB Master · beacon aktif";
-        String text  = isTracker ? "Berjalan di latar belakang."
+        // Identitas jujur: perangkat terkelola, tidak disamarkan sebagai layanan sistem.
+        String title = isTracker ? "SMB Lacak · perangkat dikelola" : "SMB Master · beacon aktif";
+        String text  = isTracker
+                ? (locationActive
+                        ? "Perangkat ini dikelola & dilacak oleh pemiliknya (lokasi & status aktif)."
+                        : "Perangkat ini dikelola & dilacak oleh pemiliknya.")
                 : locationActive ? "Lokasi GPS dan pemindaian BLE dikirim ke broker"
                 : "Pemindaian BLE aktif; izin lokasi belum diberikan";
 
@@ -503,7 +504,7 @@ public class ProximityForegroundService extends Service {
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
 
-        builder.setSmallIcon(android.R.drawable.stat_notify_sync_noanim)  // icon tidak mencolok
+        builder.setSmallIcon(R.mipmap.ic_launcher)  // ikon aplikasi, identitas jelas
                .setContentTitle(title)
                .setContentText(text)
                .setContentIntent(openPending)
@@ -519,13 +520,13 @@ public class ProximityForegroundService extends Service {
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // Channel dengan IMPORTANCE_MIN = tersembunyi dari status bar
+            // Channel IMPORTANCE_LOW: terlihat di status bar, tanpa suara.
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID,
-                    "Layanan sistem",                  // nama generik
-                    NotificationManager.IMPORTANCE_MIN // <── tersembunyi!
+                    "SMB Lacak — Perangkat Dikelola",
+                    NotificationManager.IMPORTANCE_LOW // terlihat di status bar, tanpa suara
             );
-            channel.setDescription("Layanan latar belakang.");
+            channel.setDescription("Menandakan perangkat ini dikelola dan dilacak oleh pemiliknya.");
             channel.setShowBadge(false);
             channel.enableLights(false);
             channel.enableVibration(false);
