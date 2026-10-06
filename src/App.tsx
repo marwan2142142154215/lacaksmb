@@ -534,7 +534,7 @@ function ServerDownloadsPage({ apiBase, token, brokerConnected, sites, isSuperad
   const [logUpdatedAt, setLogUpdatedAt] = useState("");
   const [downloading, setDownloading] = useState("");
   const [downloadError, setDownloadError] = useState("");
-  const [sitePicker, setSitePicker] = useState<{ step: "pick" | "code"; siteId: number | ""; code?: string; expiresAt?: string } | null>(null);
+  const [sitePicker, setSitePicker] = useState<{ step: "pick" | "code"; siteId: number | ""; code?: string; expiresAt?: string; siteName?: string } | null>(null);
   const [pickerBusy, setPickerBusy] = useState(false);
   const [pickerError, setPickerError] = useState("");
   const refreshLogs = useCallback(async () => {
@@ -555,11 +555,12 @@ function ServerDownloadsPage({ apiBase, token, brokerConnected, sites, isSuperad
     return () => window.clearInterval(timer);
   }, [refreshLogs]);
 
-  const downloadFile = async (id: "tracker" | "master" | "server", filename: string) => {
+  const downloadFile = async (id: "tracker" | "master" | "server", filename: string, siteId?: number) => {
     setDownloading(id);
     setDownloadError("");
     try {
-      const response = await fetch(`${apiBase}/api/admin/downloads/${id}`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      const query = siteId ? `?siteId=${siteId}` : "";
+      const response = await fetch(`${apiBase}/api/admin/downloads/${id}${query}`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
       if (!response.ok) {
         const error = await response.json().catch(() => null) as { message?: string } | null;
         throw new Error(error?.message || `Unduhan gagal (HTTP ${response.status}).`);
@@ -595,10 +596,11 @@ function ServerDownloadsPage({ apiBase, token, brokerConnected, sites, isSuperad
     setPickerError("");
     try {
       const response = await fetch(`${apiBase}/api/admin/sites/${siteId}/enrollment-code`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
-      const data = await response.json() as { code?: string; expiresAt?: string; message?: string };
+      const data = await response.json() as { code?: string; expiresAt?: string; message?: string; site?: { name?: string } };
       if (!response.ok || !data.code) throw new Error(data.message || "Kode enrolmen gagal dibuat.");
-      setSitePicker({ step: "code", siteId, code: data.code, expiresAt: data.expiresAt });
-      void downloadFile("tracker", "SMB-Lacak.apk");
+      const siteName = data.site?.name || sites.find((item) => item.id === siteId)?.name || "site";
+      setSitePicker({ step: "code", siteId, code: data.code, expiresAt: data.expiresAt, siteName });
+      void downloadFile("tracker", `SMB-Lacak-${siteName.replace(/[^\w-]+/g, "-")}.apk`, siteId);
     } catch (error) {
       setPickerError(error instanceof Error ? error.message : "Kode enrolmen gagal dibuat.");
     } finally { setPickerBusy(false); }
@@ -641,15 +643,16 @@ function ServerDownloadsPage({ apiBase, token, brokerConnected, sites, isSuperad
           </div>
           <small>{sites.length === 0 ? "Belum ada site/tim: unduhan berjalan tanpa kode enrolmen. Buat site/tim dulu agar APK Lacak terikat WiFi dan laporan site." : isSuperadmin ? "Kode enrolmen berlaku 24 jam, hanya bisa dipakai sekali, dan tampil satu kali saja di layar berikutnya." : "Kode enrolmen hanya dibuat oleh superadmin: pilih site sesuai HP, unduh APK, lalu minta kode untuk site itu."}</small>
         </> : <>
-          <p className="smb-eyebrow">KODE ENROLMEN</p>
-          <h2 id="smb-site-picker-title">Kode untuk {sites.find((site) => site.id === sitePicker.siteId)?.name || "site terpilih"}</h2>
+          <p className="smb-eyebrow">APK PER-SITE SIAP</p>
+          <h2 id="smb-site-picker-title">APK untuk {sites.find((site) => site.id === sitePicker.siteId)?.name || "site terpilih"}</h2>
+          <p>Kode enrolmen sudah ditanam di dalam APK yang diunduh: cukup pasang, buka, dan HP langsung terdaftar ke site ini — tanpa mengetik kode.</p>
           <code className="smb-enroll-code">{sitePicker.code}</code>
           <div className="smb-enroll-meta"><span>Berlaku sampai {sitePicker.expiresAt ? formatTime(sitePicker.expiresAt) : "24 jam"}</span><span>Sekali pakai</span></div>
           <div className="smb-modal-actions">
             <button className="smb-button-muted" onClick={() => { void navigator.clipboard?.writeText(sitePicker.code || "").catch(() => undefined); }}><Copy size={14} /> Salin kode</button>
             <button className="smb-button-primary" onClick={() => setSitePicker(null)}>Selesai</button>
           </div>
-          <small>{downloading === "tracker" ? "Menyiapkan unduhan APK Lacak…" : downloadError || "Masukkan kode ini di layar enrolmen APK Lacak setelah dipasang di HP tracker."}</small>
+          <small>{downloading === "tracker" ? "Menyiapkan unduhan APK Lacak…" : downloadError || "Kode ini hanya cadangan: APK yang Anda unduh sudah otomatis terdaftar ke site ini saat pertama dibuka."}</small>
         </>}
       </section>
     </div>}

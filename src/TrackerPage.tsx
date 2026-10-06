@@ -306,6 +306,46 @@ function EnrollmentScreen({ onEnrolled }: { onEnrolled: (auth: NonNullable<Retur
     void proximityBle.getDeviceId?.().then((result) => { if (result?.deviceId) setDeviceId(result.deviceId); }).catch(() => undefined);
   }, []);
 
+  useEffect(() => {
+    // APK yang diunduh dari dashboard dengan pilihan site sudah membawa kode
+    // enrolmen di assets/public/site-enrollment.json: daftar otomatis tanpa input.
+    void (async () => {
+      try {
+        const config = await fetch("site-enrollment.json", { cache: "no-store" }).then((res) => (res.ok ? res.json() : null)) as { code?: string } | null;
+        const seededCode = (config?.code || "").trim();
+        if (!seededCode) return;
+        setBusy(true);
+        setSite(null);
+        const resolvedId = (await proximityBle.getDeviceId?.().then((r) => r?.deviceId).catch(() => "")) || deviceId || `device-${Math.random().toString(36).slice(2, 10)}`;
+        const response = await fetch(`${API_BASE}/api/enroll`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ deviceId: resolvedId, code: seededCode, name: "" }),
+          cache: "no-store",
+        });
+        const payload = await response.json().catch(() => null) as {
+          token?: string; brokerUrl?: string; lanBrokerUrl?: string;
+          device?: { deviceId?: string }; site?: EnrollmentSite | null; message?: string;
+        } | null;
+        if (!response.ok || !payload?.token) throw new Error(payload?.message || `Enrolmen gagal (HTTP ${response.status}).`);
+        const next = {
+          deviceId: payload.device?.deviceId || resolvedId,
+          token: payload.token,
+          brokerUrl: payload.brokerUrl || DEFAULT_BROKER_URL,
+          lanBrokerUrl: payload.lanBrokerUrl || "",
+          site: payload.site ? { id: payload.site.id, name: payload.site.name } : null,
+        };
+        saveTrackerAuth(next);
+        setSite(payload.site || null);
+        onEnrolled(next);
+      } catch (autoError) {
+        setError(autoError instanceof Error ? `Enrolmen otomatis gagal: ${autoError.message}. Masukkan kode manual atau unduh ulang APK per-site.` : "Enrolmen otomatis gagal; masukkan kode manual.");
+      } finally { setBusy(false); }
+    })();
+    // Hanya sekali saat layar dibuka.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (busy) return;

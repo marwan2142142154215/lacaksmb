@@ -5,6 +5,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { DatabaseSync } from "node:sqlite";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+const runFile = promisify(execFile);
 import { createCipheriv, createDecipheriv, randomBytes, randomInt, X509Certificate } from "node:crypto";
 import {
   bootstrapFirstAdmin,
@@ -390,6 +393,62 @@ function enrollPayload(deviceId, token) {
   };
 }
 
+/**
+ * Buat salinan APK Lacak dengan kode enrolmen site ditanam di
+ * assets/public/site-enrollment.json. Setelah dipasang, HP membaca file
+ * tersebut dan enrolmen berjalan otomatis — tanpa mengetik kode.
+ * Hasilnya ditandatangani ulang dengan debug keystore sehingga tetap valid.
+ */
+async function buildSiteBoundTrackerApk(site, issuedBy) {
+  const sourceApk = path.join(root, "artifacts", "SMB-Lacak.apk");
+  const workDir = path.join(root, "data", `apk-site-${site.id}-${randomBytes(4).toString("hex")}`);
+  fs.mkdirSync(workDir, { recursive: true });
+  try {
+    const code = generateEnrollmentCode();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 24 * 60 * 60_000).toISOString();
+    database.prepare("INSERT INTO enrollment_codes (code_hash,site_id,device_label,issued_by,created_at,expires_at) VALUES (?,?,?,?,?,?)")
+      .run(tokenDigest(code), site.id, null, issuedBy, now.toISOString(), expiresAt);
+
+    const extractDir = path.join(workDir, "unzipped");
+    fs.cpSync(sourceApk, path.join(workDir, "input.zip"));
+    await runFile("powershell", ["-NoProfile", "-Command", `Expand-Archive -Path "${path.join(workDir, "input.zip")}" -DestinationPath "${extractDir}" -Force`]);
+
+    fs.writeFileSync(
+      path.join(extractDir, "assets", "public", "site-enrollment.json"),
+      JSON.stringify({ code, siteId: site.id, siteName: site.name, expiresAt }),
+      "utf8",
+    );
+    // Tanda tangan lama jadi tidak valid setelah isi diubah; hapus agar tidak bentrok.
+    fs.rmSync(path.join(extractDir, "META-INF"), { recursive: true, force: true });
+
+    const unsignedZip = path.join(workDir, "unsigned.zip");
+    await runFile("powershell", ["-NoProfile", "-Command", `Compress-Archive -Path "${extractDir}\\*" -DestinationPath "${unsignedZip}" -Force`]);
+
+    const sdkBuildTools = path.join(process.env.LOCALAPPDATA || "", "Android", "Sdk", "build-tools");
+    let version = "";
+    for (const candidate of fs.readdirSync(sdkBuildTools)) version = candidate;
+    const zipalign = path.join(sdkBuildTools, version, "zipalign.exe");
+    const apksigner = path.join(sdkBuildTools, version, "apksigner.bat");
+    const aligned = path.join(workDir, "aligned.apk");
+    await runFile(zipalign, ["-f", "4", unsignedZip, aligned]);
+
+    const debugKeystore = path.join(os.homedir(), ".android", "debug.keystore");
+    await new Promise((resolve, reject) => {
+      execFile("cmd.exe", ["/c", apksigner, "sign", "--ks", debugKeystore, "--ks-key-alias", "androiddebugkey", "--ks-pass", "pass:android", "--key-pass", "pass:android", aligned], (error, stdout, stderr) => {
+        if (error) reject(new Error(`apksigner gagal: ${stderr || stdout || error.message}`));
+        else resolve();
+      });
+    });
+
+    const downloadName = `SMB-Lacak-${site.name.replace(/[^\w-]+/g, "-")}.apk`;
+    return { apkPath: aligned, downloadName };
+  } catch (error) {
+    fs.rm(workDir, { recursive: true, force: true }, () => {});
+    throw error;
+  }
+}
+
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 function generateEnrollmentCode() {
   const bytes = randomBytes(8);
@@ -611,18 +670,48 @@ const server = https.createServer({
     respondJson(response, 200, { ok: true, message: "Akses Telegram dicabut." });
     return;
   }
-  const downloadMatch = request.method === "GET" && request.url.match(/^\/api\/admin\/downloads\/(tracker|master|server)$/);
+  const downloadMatch = request.method === "GET" && request.url.match(/^\/api\/admin\/downloads\/(tracker|master|server)(?:\?.*)?$/);
   if (downloadMatch) {
     const admin = requireAdminSession(request, response);
     if (!admin) return;
     const artifact = artifactDownloads[downloadMatch[1]];
     const artifactPath = path.join(root, "artifacts", artifact.file);
-    let stat;
-    try { stat = fs.statSync(artifactPath); }
+    try { fs.statSync(artifactPath); }
     catch {
       respondJson(response, 404, { error: "artifact_unavailable", message: "File unduhan belum dibuat pada PC broker." });
       return;
     }
+
+    // APK Lacak per-site: kode enrolmen 24 jam ditanamkan ke dalam APK, jadi HP
+    // langsung terdaftar ke site tsb tanpa perlu mengetik kode apa pun.
+    const query = new URL(request.url, "https://local").searchParams;
+    const siteIdParam = query.get("siteId");
+    if (downloadMatch[1] === "tracker" && siteIdParam) {
+      if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden", message: "Hanya superadmin yang boleh membuat APK per-site." }); return; }
+      const siteId = Number(siteIdParam);
+      const site = sites.get(siteId);
+      if (!site) { respondJson(response, 404, { error: "site_not_found", message: "Site/tim tidak ditemukan." }); return; }
+      void buildSiteBoundTrackerApk(site, admin.username).then(({ apkPath, downloadName }) => {
+        response.writeHead(200, {
+          "content-type": artifact.contentType,
+          "content-length": fs.statSync(apkPath).size,
+          "content-disposition": `attachment; filename="${downloadName}"`,
+          "cache-control": "private, no-store",
+          "x-content-type-options": "nosniff",
+        });
+        const stream = fs.createReadStream(apkPath);
+        stream.on("end", () => fs.rm(path.dirname(apkPath), { recursive: true, force: true }, () => {}));
+        stream.on("error", () => response.destroy());
+        stream.pipe(response);
+      }).catch((error) => {
+        console.error("Gagal membuat APK per-site:", error);
+        if (!response.headersSent) respondJson(response, 500, { error: "apk_patch_failed", message: `Gagal menyiapkan APK per-site: ${error.message}` });
+        else response.destroy();
+      });
+      return;
+    }
+
+    const stat = fs.statSync(artifactPath);
     response.writeHead(200, {
       "content-type": artifact.contentType,
       "content-length": stat.size,
