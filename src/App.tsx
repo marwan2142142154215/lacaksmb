@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import {
   Activity, AlertTriangle, ArrowUpRight, Battery, Bluetooth, Bot, Check, ChevronRight,
-  CircleAlert, Clock3, Command, EyeOff, LayoutDashboard, ListChecks, LockKeyhole,
+  CircleAlert, Clock3, Command, Download, EyeOff, FileText, HardDriveDownload, LayoutDashboard, ListChecks, LockKeyhole,
   LogOut, MapPin, MapPinOff, Menu, Network, Pencil, PlugZap, Radio, RefreshCw, Search, Server,
   Settings2, ShieldCheck, Smartphone, UnlockKeyhole, Users, Wifi, X,
 } from "lucide-react";
@@ -14,7 +14,7 @@ import "./AdminAuth.css";
 
 const MASTER_ID = "R9RY506354P";
 const TRACKER_ID = "R9RXC03EC9N";
-type Page = "overview" | "devices" | "commands" | "proximity" | "policy" | "integrations" | "settings" | "admins";
+type Page = "overview" | "devices" | "commands" | "proximity" | "policy" | "integrations" | "server" | "settings" | "admins";
 type CommandRow = { id: string; deviceId: string; command: string; issuedBy: string; status: string; createdAt: string; completedAt?: string; detail?: string };
 type Device = { deviceId: string; name: string; role?: string; online: boolean; lastSeenAt?: string | null; telemetry?: PilotTelemetry | null };
 type SignalSample = { minuteAt: string; sampleCount: number; detectedCount: number; rssiAvg: number | null; rssiMin: number | null; rssiMax: number | null; batteryLevel: number | null };
@@ -28,6 +28,7 @@ const navigation: Array<{ id: Page; title: string; icon: typeof LayoutDashboard;
   { id: "proximity", title: "Kedekatan BLE", icon: Bluetooth, group: "KONTROL" },
   { id: "policy", title: "Kebijakan Android", icon: ShieldCheck },
   { id: "integrations", title: "Integrasi", icon: PlugZap, group: "SISTEM" },
+  { id: "server", title: "Server & unduhan", icon: HardDriveDownload },
   { id: "admins", title: "Akun admin", icon: Users, group: "SISTEM" },
   { id: "settings", title: "Pengaturan", icon: Settings2 },
 ];
@@ -38,6 +39,7 @@ const pageTitles: Record<Page, { title: string; description: string }> = {
   proximity: { title: "Kedekatan BLE", description: "Status pemindaian beacon aktual. RSSI bukan pengukuran jarak meter." },
   policy: { title: "Kebijakan Android", description: "Status Device Owner dan batasan lock task yang dilaporkan tracker." },
   integrations: { title: "Integrasi", description: "Koneksi yang benar-benar dikonfigurasi oleh broker saat ini." },
+  server: { title: "Server & unduhan", description: "Log terbaru broker PC dan APK resmi untuk perangkat armada." },
   settings: { title: "Pengaturan sistem", description: "Identitas master, broker, penyimpanan, dan kemampuan yang aktif." },
   admins: { title: "Akun admin", description: "Kelola akses staf dengan password unik dan 2FA authenticator." },
 };
@@ -333,6 +335,7 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
           {page === "proximity" && <ProximityPage telemetry={trackerTelemetry} devices={devices} />}
           {page === "policy" && <PolicyPage telemetry={trackerTelemetry} />}
           {page === "integrations" && <IntegrationsPage brokerConnected={broker.connected} telegramConfigured={snapshot?.telegram.configured || false} supabaseConfigured={snapshot?.supabase.configured || false} />}
+          {page === "server" && <ServerDownloadsPage apiBase={apiBase} token={token} brokerConnected={broker.connected} />}
           {page === "settings" && <><SettingsPage devices={devices} telemetry={trackerTelemetry} brokerConnected={broker.connected} telegramConfigured={snapshot?.telegram.configured || false} /><ChangePasswordPanel apiBase={apiBase} token={token} /></>}
           {page === "admins" && adminUser.role === "superadmin" && <AdminUsersPage apiBase={apiBase} token={token} />}
           <footer className="smb-page-footer"><span>SMB Master · {MASTER_ID}</span><span>Data berasal dari broker lokal · {lastUpdate}</span></footer>
@@ -430,6 +433,78 @@ function PolicyPage({ telemetry }: { telemetry: Snapshot["telemetry"] | null | u
   const owner = Boolean(telemetry?.deviceOwner);
   const locked = Boolean(telemetry?.lockTaskMode);
   return <div className="smb-two-column-page"><section className="smb-panel smb-policy-card"><div className={`smb-policy-icon ${owner ? "is-ready" : ""}`}><ShieldCheck size={25} /></div><span className="smb-panel-kicker">DEVICE POLICY CONTROLLER</span><h2>{owner ? "Device Owner aktif" : "Belum dikonfirmasi"}</h2><p>Status yang terakhir diterima dari aplikasi tracker Android.</p><div className="smb-policy-status-list"><ServiceRow icon={<ShieldCheck size={17} />} label="Android Device Owner" value={owner ? "Aktif" : "Tidak terlapor"} ok={owner} /><ServiceRow icon={<LockKeyhole size={17} />} label="Lock Task" value={locked ? "Aktif" : "Tidak aktif"} ok={locked} /><ServiceRow icon={<Smartphone size={17} />} label="Aktivitas tracker di depan" value="Tidak dilaporkan" ok={false} /></div></section><section className="smb-panel"><PanelHeading kicker="BATAS ANDROID" title="Perilaku kontrol perangkat" /><div className="smb-capability-list"><CapabilityRow good icon={<Check size={16} />} title="Pembatasan kiosk tersedia" text="Device Owner dapat mengizinkan aplikasi tracker masuk Lock Task." /><CapabilityRow icon={<AlertTriangle size={16} />} title="Perintah jarak jauh bisa ditolak" text="Android mensyaratkan kondisi aktivitas yang sesuai; broker hanya mencatat ACK atau error aktual." /><CapabilityRow icon={<EyeOff size={16} />} title="Kamera rahasia tidak tersedia" text="Pengambilan kamera diam-diam tidak disediakan. Android menampilkan izin dan indikator privasi." /></div><div className="smb-policy-warning"><AlertTriangle size={17} /><span>Lock Task membatasi perangkat hanya ketika kebijakan Android dan status activity mengizinkan. Ini bukan jaminan perangkat sama sekali tidak bisa dipakai di semua kondisi.</span></div></section></div>;
+}
+
+type OperationLogEntry = { source: string; timestamp: string; message: string };
+type ServerOperations = { generatedAt: string; broker: { status: string; host: string; port: number }; logs: OperationLogEntry[] };
+
+function ServerDownloadsPage({ apiBase, token, brokerConnected }: { apiBase: string; token: string; brokerConnected: boolean }) {
+  const [logs, setLogs] = useState<OperationLogEntry[]>([]);
+  const [logsState, setLogsState] = useState("Mengambil log broker…");
+  const [logUpdatedAt, setLogUpdatedAt] = useState("");
+  const [downloading, setDownloading] = useState("");
+  const [downloadError, setDownloadError] = useState("");
+  const refreshLogs = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBase}/api/admin/operations`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      if (!response.ok) throw new Error(`Broker HTTP ${response.status}`);
+      const data = await response.json() as ServerOperations;
+      setLogs(data.logs);
+      setLogsState(data.logs.length ? `${data.logs.length} baris log` : "Belum ada log tersimpan");
+      setLogUpdatedAt(data.generatedAt);
+    } catch (error) {
+      setLogsState(error instanceof Error ? error.message : "Tidak dapat membaca log broker.");
+    }
+  }, [apiBase, token]);
+  useEffect(() => {
+    void refreshLogs();
+    const timer = window.setInterval(() => void refreshLogs(), 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshLogs]);
+
+  const downloadFile = async (id: "tracker" | "master" | "server", filename: string) => {
+    setDownloading(id);
+    setDownloadError("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/downloads/${id}`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      if (!response.ok) {
+        const error = await response.json().catch(() => null) as { message?: string } | null;
+        throw new Error(error?.message || `Unduhan gagal (HTTP ${response.status}).`);
+      }
+      const blobUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    } catch (error) {
+      setDownloadError(error instanceof Error ? error.message : "Unduhan gagal.");
+    } finally { setDownloading(""); }
+  };
+
+  const files = [
+    { id: "tracker" as const, title: "SMB Lacak", kind: "APK ANDROID · TRACKER", filename: "SMB-Lacak.apk", detail: "Aplikasi tracker untuk perangkat armada. Build APK debug terbaru yang tersedia di PC broker.", icon: <MapPin size={20} />, button: "Unduh APK Lacak" },
+    { id: "master" as const, title: "SMB Master", kind: "APK ANDROID · MASTER", filename: "SMB-Master.apk", detail: "Aplikasi master untuk dashboard kontrol di perangkat Android.", icon: <Smartphone size={20} />, button: "Unduh APK Master" },
+    { id: "server" as const, title: "SMB Server Console", kind: "WINDOWS · GUI", filename: "SMB-Fleet-Server.exe", detail: "Jendela kontrol broker PC dengan status server dan log langsung. Jalankan dari folder proyek yang berisi server dan .env.local.", icon: <Server size={20} />, button: "Unduh Server Console" },
+  ];
+
+  return <div className="smb-server-page">
+    <div className="smb-server-status-grid">
+      <div className="smb-panel smb-server-status-card"><span className={`smb-server-status-icon ${brokerConnected ? "is-good" : ""}`}><Server size={18} /></span><div><small>KONEKSI DASHBOARD</small><strong>{brokerConnected ? "Tersambung ke broker" : "Dashboard belum tersambung"}</strong><span>WSS · broker.lacaksmbbot.com</span></div><i className={`smb-live-dot ${brokerConnected ? "" : "is-off"}`} /></div>
+      <div className="smb-panel smb-server-status-card"><span className="smb-server-status-icon is-good"><FileText size={18} /></span><div><small>LOG BROKER PC</small><strong>{logsState}</strong><span>{logUpdatedAt ? `Diperbarui ${formatTime(logUpdatedAt)}` : "Log diperbarui otomatis setiap 5 detik"}</span></div><button className="smb-icon-button" onClick={() => void refreshLogs()} title="Muat ulang log"><RefreshCw size={16} /></button></div>
+    </div>
+
+    <section className="smb-panel smb-download-section"><div className="smb-server-section-heading"><div><span className="smb-panel-kicker">PAKET PERANGKAT</span><h2>Unduh aplikasi dan server</h2><p>File diambil dari PC broker sesudah dashboard memverifikasi sesi admin.</p></div><span className="smb-download-lock"><ShieldCheck size={14} /> ADMIN SAJA</span></div>
+      <div className="smb-download-grid">{files.map((file) => <article className="smb-download-card" key={file.id}><div className="smb-download-card-top"><span className="smb-download-icon">{file.icon}</span><span className="smb-download-kind">{file.kind}</span></div><h3>{file.title}</h3><p>{file.detail}</p><div className="smb-download-file"><FileText size={14} /><span>{file.filename}</span><Download size={14} /></div><button className="smb-button-primary smb-download-button" disabled={downloading !== ""} onClick={() => void downloadFile(file.id, file.filename)}><Download size={15} />{downloading === file.id ? "Menyiapkan unduhan…" : file.button}</button></article>)}</div>
+      {downloadError && <div className="smb-admin-feedback is-error">{downloadError}</div>}
+    </section>
+
+    <section className="smb-panel smb-server-log-panel"><div className="smb-server-section-heading"><div><span className="smb-panel-kicker">AKTIVITAS SERVER</span><h2>Log broker dan Tunnel</h2><p>Log dibaca dari file lokal launcher Windows; tidak berisi isi .env atau token.</p></div><button className="smb-button-muted smb-log-refresh" onClick={() => void refreshLogs()}><RefreshCw size={14} /> Muat ulang</button></div>
+      <div className="smb-server-log-list" aria-live="polite">{logs.length ? logs.map((entry, index) => <div className="smb-server-log-row" key={`${entry.source}-${entry.timestamp}-${index}`}><time>{entry.timestamp || "—"}</time><span className={`smb-log-source source-${entry.source}`}>{entry.source}</span><code>{entry.message}</code></div>) : <div className="smb-server-log-empty"><FileText size={21} /><strong>{logsState}</strong><span>Jalankan SMB Server Console di PC agar keluaran broker muncul sebagai log langsung.</span></div>}</div>
+    </section>
+  </div>;
 }
 
 function IntegrationsPage({ brokerConnected, telegramConfigured, supabaseConfigured }: { brokerConnected: boolean; telegramConfigured: boolean; supabaseConfigured: boolean }) {

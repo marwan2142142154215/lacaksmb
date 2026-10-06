@@ -27,6 +27,17 @@ import {
 } from "./adminAuth.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const artifactDownloads = Object.freeze({
+  tracker: { file: "SMB-Lacak.apk", downloadName: "SMB-Lacak.apk", contentType: "application/vnd.android.package-archive" },
+  master: { file: "SMB-Master.apk", downloadName: "SMB-Master.apk", contentType: "application/vnd.android.package-archive" },
+  server: { file: "SMB-Fleet-Server.exe", downloadName: "SMB-Fleet-Server.exe", contentType: "application/vnd.microsoft.portable-executable" },
+});
+const operationLogFiles = [
+  ["broker", "fleet-server.log"],
+  ["error", "fleet-server-error.log"],
+  ["launcher", "fleet-launcher.log"],
+  ["tunnel", "cloudflared.log"],
+];
 const envFile = path.join(root, ".env.local");
 if (fs.existsSync(envFile)) {
   for (const line of fs.readFileSync(envFile, "utf8").split(/\r?\n/)) {
@@ -194,6 +205,29 @@ async function readJsonRequest(request, maxBytes = 16_384) {
   }
 }
 
+function readOperationLogs(maxEntries = 200) {
+  const entries = [];
+  const logDirectory = path.join(root, ".tools");
+  for (const [source, filename] of operationLogFiles) {
+    const logPath = path.join(logDirectory, filename);
+    try {
+      const size = fs.statSync(logPath).size;
+      if (size === 0) continue;
+      const bytesToRead = Math.min(size, 256 * 1024);
+      const buffer = Buffer.alloc(bytesToRead);
+      const file = fs.openSync(logPath, "r");
+      try { fs.readSync(file, buffer, 0, bytesToRead, Math.max(0, size - bytesToRead)); }
+      finally { fs.closeSync(file); }
+      const lines = buffer.toString("utf8").split(/\r?\n/).filter(Boolean);
+      for (const line of lines) {
+        const match = line.match(/^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s+(.*)$/);
+        entries.push({ source, timestamp: match?.[1] || "", message: match?.[2] || line });
+      }
+    } catch { /* Log files are optional until the desktop launcher starts. */ }
+  }
+  return entries.sort((a, b) => a.timestamp.localeCompare(b.timestamp)).slice(-maxEntries).reverse();
+}
+
 const server = https.createServer({
   pfx: fs.readFileSync(pfxPath),
   passphrase: pfxPassphrase,
@@ -302,6 +336,36 @@ const server = https.createServer({
       updateAdminPassword(database, admin.id, body.newPassword);
       respondJson(response, 200, { ok: true, message: "Password berhasil diperbarui." });
     }).catch((error) => respondJson(response, error.statusCode || 400, { error: error.code || "invalid_request", message: error.publicMessage || error.message || "Password tidak dapat diperbarui." }));
+    return;
+  }
+  if (request.method === "GET" && request.url === "/api/admin/operations") {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    respondJson(response, 200, { generatedAt: new Date().toISOString(), broker: { status: "online", host, port }, logs: readOperationLogs() });
+    return;
+  }
+  const downloadMatch = request.method === "GET" && request.url.match(/^\/api\/admin\/downloads\/(tracker|master|server)$/);
+  if (downloadMatch) {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    const artifact = artifactDownloads[downloadMatch[1]];
+    const artifactPath = path.join(root, "artifacts", artifact.file);
+    let stat;
+    try { stat = fs.statSync(artifactPath); }
+    catch {
+      respondJson(response, 404, { error: "artifact_unavailable", message: "File unduhan belum dibuat pada PC broker." });
+      return;
+    }
+    response.writeHead(200, {
+      "content-type": artifact.contentType,
+      "content-length": stat.size,
+      "content-disposition": `attachment; filename=\"${artifact.downloadName}\"`,
+      "cache-control": "private, no-store",
+      "x-content-type-options": "nosniff",
+    });
+    const stream = fs.createReadStream(artifactPath);
+    stream.on("error", () => { if (!response.headersSent) respondJson(response, 500, { error: "download_failed" }); else response.destroy(); });
+    stream.pipe(response);
     return;
   }
   if (request.method === "GET" && request.url === "/api/admin/users") {

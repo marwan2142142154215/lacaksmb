@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">Nusa Fleet</string>
-    <string name="title_activity_main">Nusa Fleet</string>
+    <string name="app_name">SMB Lacak Bot</string>
+    <string name="title_activity_main">SMB Lacak Bot</string>
     <string name="package_name">id.nusarental.fleetconsole</string>
     <string name="custom_url_scheme">id.nusarental.fleetconsole</string>
 </resources>
