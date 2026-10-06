@@ -14,7 +14,7 @@ import "./AdminAuth.css";
 
 const MASTER_ID = "R9RY506354P";
 const TRACKER_ID = "R9RXC03EC9N";
-type Page = "overview" | "devices" | "commands" | "proximity" | "policy" | "integrations" | "server" | "settings" | "admins";
+type Page = "overview" | "devices" | "commands" | "proximity" | "policy" | "integrations" | "server" | "settings" | "admins" | "telegram";
 type CommandRow = { id: string; deviceId: string; command: string; issuedBy: string; status: string; createdAt: string; completedAt?: string; detail?: string };
 type Device = { deviceId: string; name: string; role?: string; online: boolean; lastSeenAt?: string | null; telemetry?: PilotTelemetry | null };
 type SignalSample = { minuteAt: string; sampleCount: number; detectedCount: number; rssiAvg: number | null; rssiMin: number | null; rssiMax: number | null; batteryLevel: number | null };
@@ -23,18 +23,19 @@ type Snapshot = { generatedAt: string; devices: Device[]; telemetry: PilotTeleme
 
 const navigation: Array<{ id: Page; title: string; icon: typeof LayoutDashboard; group?: string }> = [
   { id: "overview", title: "Ringkasan", icon: LayoutDashboard },
-  { id: "devices", title: "Perangkat", icon: Smartphone, group: "ARMADA" },
+  { id: "devices", title: "Kelola perangkat", icon: Smartphone, group: "ARMADA" },
   { id: "commands", title: "Antrean perintah", icon: ListChecks },
   { id: "proximity", title: "Kedekatan BLE", icon: Bluetooth, group: "KONTROL" },
   { id: "policy", title: "Kebijakan Android", icon: ShieldCheck },
   { id: "integrations", title: "Integrasi", icon: PlugZap, group: "SISTEM" },
   { id: "server", title: "Server & unduhan", icon: HardDriveDownload },
   { id: "admins", title: "Akun admin", icon: Users, group: "SISTEM" },
+  { id: "telegram", title: "Akses Telegram", icon: Bot },
   { id: "settings", title: "Pengaturan", icon: Settings2 },
 ];
 const pageTitles: Record<Page, { title: string; description: string }> = {
   overview: { title: "Ringkasan armada", description: "Kondisi perangkat yang dilaporkan langsung ke broker lokal." },
-  devices: { title: "Perangkat", description: "Pilih satu perangkat dan pastikan ID target sebelum mengirim perintah." },
+  devices: { title: "Kelola perangkat", description: "Pilih satu perangkat dan pastikan ID target sebelum mengirim perintah." },
   commands: { title: "Antrean perintah", description: "Riwayat broker tersimpan di SQLite pada PC ini." },
   proximity: { title: "Kedekatan BLE", description: "Status pemindaian beacon aktual. RSSI bukan pengukuran jarak meter." },
   policy: { title: "Kebijakan Android", description: "Status Device Owner dan batasan lock task yang dilaporkan tracker." },
@@ -42,6 +43,7 @@ const pageTitles: Record<Page, { title: string; description: string }> = {
   server: { title: "Server & unduhan", description: "Log terbaru broker PC dan APK resmi untuk perangkat armada." },
   settings: { title: "Pengaturan sistem", description: "Identitas master, broker, penyimpanan, dan kemampuan yang aktif." },
   admins: { title: "Akun admin", description: "Kelola akses staf dengan password unik dan 2FA authenticator." },
+  telegram: { title: "Akses Telegram", description: "Buat OTP sekali pakai dan cabut akses bot untuk chat yang tidak lagi berwenang." },
 };
 
 function App() {
@@ -316,7 +318,7 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
         <div className="smb-brand"><div className="smb-brand-mark"><Radio size={21} /></div><div><strong>SMB <span>Master</span></strong><small>FLEET CONTROL</small></div><button className="smb-close-sidebar" onClick={() => setSidebarOpen(false)} aria-label="Tutup menu"><X size={18} /></button></div>
         <div className="smb-master-card"><div className="smb-avatar">SM</div><div><strong>Master utama</strong><span>ID {MASTER_ID}</span></div><span className={`smb-presence ${broker.connected ? "is-online" : ""}`} title={broker.connected ? "Tersambung" : "Terputus"} /></div>
         <nav className="smb-navigation" aria-label="Navigasi utama">
-          {navigation.filter((item) => item.id !== "admins" || adminUser.role === "superadmin").map((item, index) => <div key={item.id}>{item.group && <div className={`smb-nav-group ${index > 0 ? "smb-nav-group-spaced" : ""}`}>{item.group}</div>}<button className={`smb-nav-link ${page === item.id ? "is-active" : ""}`} onClick={() => go(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.title}</span>{item.id === "commands" && commands.filter((row) => row.status === "pending" || row.status === "sent").length > 0 && <b>{commands.filter((row) => row.status === "pending" || row.status === "sent").length}</b>}</button></div>)}
+          {navigation.filter((item) => (item.id !== "admins" && item.id !== "telegram") || adminUser.role === "superadmin").map((item, index) => <div key={item.id}>{item.group && <div className={`smb-nav-group ${index > 0 ? "smb-nav-group-spaced" : ""}`}>{item.group}</div>}<button className={`smb-nav-link ${page === item.id ? "is-active" : ""}`} onClick={() => go(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.title}</span>{item.id === "commands" && commands.filter((row) => row.status === "pending" || row.status === "sent").length > 0 && <b>{commands.filter((row) => row.status === "pending" || row.status === "sent").length}</b>}</button></div>)}
         </nav>
         <div className="smb-sidebar-bottom"><div className="smb-broker-indicator"><span className={`smb-live-dot ${broker.connected ? "" : "is-off"}`} /><div><strong>Broker PC</strong><small>{broker.connected ? "Terhubung via WSS TLS" : "Tidak terhubung"}</small></div><Wifi size={16} /></div><div className="smb-sidebar-foot">SMB FLEET · LOCAL BROKER</div></div>
       </aside>
@@ -338,6 +340,7 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
           {page === "server" && <ServerDownloadsPage apiBase={apiBase} token={token} brokerConnected={broker.connected} />}
           {page === "settings" && <><SettingsPage devices={devices} telemetry={trackerTelemetry} brokerConnected={broker.connected} telegramConfigured={snapshot?.telegram.configured || false} /><ChangePasswordPanel apiBase={apiBase} token={token} /></>}
           {page === "admins" && adminUser.role === "superadmin" && <AdminUsersPage apiBase={apiBase} token={token} />}
+          {page === "telegram" && adminUser.role === "superadmin" && <TelegramAccessPage apiBase={apiBase} token={token} />}
           <footer className="smb-page-footer"><span>SMB Master · {MASTER_ID}</span><span>Data berasal dari broker lokal · {lastUpdate}</span></footer>
         </div>
       </main>
@@ -414,7 +417,7 @@ function DevicesPage({ devices, search, setSearch, selected, telemetry, onlineCo
   devices: Device[]; search: string; setSearch: (value: string) => void; selected?: Device; telemetry: Device["telemetry"]; onlineCount: number; onSelect: (id: string) => void; onCommand: (command: "lock" | "unlock") => void; onRename: () => void;
 }) {
   return <div className="smb-device-page-grid"><section className="smb-panel smb-device-table-panel"><div className="smb-list-toolbar"><div><span className="smb-panel-kicker">REGISTRI PERANGKAT</span><strong>{devices.length} perangkat ditemukan · {onlineCount} online</strong></div><label className="smb-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Cari nama atau ID" /></label></div><div className="smb-device-table"><div className="smb-table-head"><span>PERANGKAT</span><span>STATUS</span><span>TELEMETRI</span><span /></div>{devices.map((device) => <button className={`smb-table-row ${selected?.deviceId === device.deviceId ? "is-selected" : ""}`} key={device.deviceId} onClick={() => onSelect(device.deviceId)}><div className="smb-table-device"><div className="smb-device-type-icon"><Smartphone size={18} /></div><div><strong>{device.name}</strong><small>{device.deviceId}</small></div></div><span className={`smb-status-pill ${device.online ? "status-on" : "status-off"}`}><i />{device.online ? "ONLINE" : "OFFLINE"}</span><span className="smb-table-telemetry">{device.deviceId === TRACKER_ID && telemetry?.detected ? `BLE ${telemetry.rssi ?? "—"} dBm` : device.lastSeenAt ? `Terlihat ${formatTime(device.lastSeenAt)}` : "Belum ada data"}</span><ChevronRight size={16} /></button>)}{devices.length === 0 && <EmptyState icon={<Search size={20} />} title="Tidak ada hasil" body="Coba cari dengan nama atau ID perangkat yang tepat." />}</div><div className="smb-table-footer"><span>Menampilkan data registri nyata</span><span><span className="smb-live-dot" /> Sinkron dengan broker</span></div></section>
-    {selected ? <section className="smb-panel smb-device-detail"><div className="smb-detail-top"><div className="smb-device-type-icon detail-device-icon"><Smartphone size={21} /></div><span className={`smb-status-pill ${selected.online ? "status-on" : "status-off"}`}>{selected.online ? "ONLINE" : "OFFLINE"}</span></div><span className="smb-panel-kicker">DETAIL PERANGKAT</span><h2>{selected.name}</h2><code className="smb-detail-id">{selected.deviceId}</code><div className="smb-detail-divider" /><div className="smb-detail-info"><DetailValue label="Peran" value={selected.role === "master" ? "Master" : "Tracker sewa"} /><DetailValue label="Koneksi" value={selected.online ? "Online saat ini" : "Offline"} /><DetailValue label="Terakhir terlihat" value={selected.lastSeenAt ? formatTime(selected.lastSeenAt) : "Belum tersedia"} /><DetailValue label="BLE" value={selected.deviceId === TRACKER_ID && telemetry?.detected ? `${telemetry.rssi ?? "—"} dBm` : "Tidak terdeteksi"} /><DetailValue label="Baterai" value={selected.deviceId === TRACKER_ID && telemetry?.batteryLevel != null ? `${telemetry.batteryLevel}%` : "Belum dilaporkan"} /><DetailValue label="Lokasi" value={telemetry?.locationAt ? "GPS aktif" : "GPS menunggu"} /></div><div className="smb-detail-actions"><button className="smb-button-muted" onClick={onRename} disabled={selected.deviceId !== TRACKER_ID}><Pencil size={15} /> Ubah nama</button><button className="smb-button-danger" onClick={() => onCommand("lock")} disabled={selected.deviceId !== TRACKER_ID || !telemetry?.deviceOwner}><LockKeyhole size={15} /> Lock kios</button><button className="smb-button-outline" onClick={() => onCommand("unlock")} disabled={selected.deviceId !== TRACKER_ID || !selected.online}><UnlockKeyhole size={15} /> Buka kios</button></div>{selected.deviceId !== TRACKER_ID && <div className="smb-info-note"><AlertTriangle size={16} /><span>Command pilot saat ini hanya diaktifkan untuk tracker {TRACKER_ID}.</span></div>}</section> : <section className="smb-panel smb-device-detail"><EmptyState icon={<Smartphone size={21} />} title="Pilih perangkat" body="Pilih satu baris untuk melihat telemetri dan aksi yang tersedia." /></section>}</div>;
+    {selected ? <section className="smb-panel smb-device-detail"><div className="smb-detail-top"><div className="smb-device-type-icon detail-device-icon"><Smartphone size={21} /></div><span className={`smb-status-pill ${selected.online ? "status-on" : "status-off"}`}>{selected.online ? "ONLINE" : "OFFLINE"}</span></div><span className="smb-panel-kicker">DETAIL PERANGKAT</span><h2>{selected.name}</h2><code className="smb-detail-id">{selected.deviceId}</code><div className="smb-detail-divider" /><div className="smb-detail-info"><DetailValue label="Peran" value={selected.role === "master" ? "Master" : "Tracker sewa"} /><DetailValue label="Koneksi" value={selected.online ? "Online saat ini" : "Offline"} /><DetailValue label="Terakhir terlihat" value={selected.lastSeenAt ? formatTime(selected.lastSeenAt) : "Belum tersedia"} /><DetailValue label="BLE" value={selected.deviceId === TRACKER_ID && telemetry?.detected ? `${telemetry.rssi ?? "—"} dBm` : "Tidak terdeteksi"} /><DetailValue label="Baterai" value={selected.deviceId === TRACKER_ID && telemetry?.batteryLevel != null ? `${telemetry.batteryLevel}%` : "Belum dilaporkan"} /><DetailValue label="Lokasi" value={telemetry?.locationAt && telemetry.latitude != null && telemetry.longitude != null ? `${telemetry.latitude}, ${telemetry.longitude}` : "Belum ada koordinat aktual"} /></div>{telemetry?.locationAt && telemetry.latitude != null && telemetry.longitude != null && <a className="smb-device-map-link" href={`https://maps.google.com/?q=${telemetry.latitude},${telemetry.longitude}`} target="_blank" rel="noreferrer"><MapPin size={14} /> Buka peta lokasi - akurasi +/-{telemetry.accuracyMeters == null ? "tidak tersedia" : `${Math.round(telemetry.accuracyMeters)} m`}</a>}<div className="smb-detail-actions"><button className="smb-button-muted" onClick={onRename} disabled={selected.deviceId !== TRACKER_ID}><Pencil size={15} /> Ubah nama</button><button className="smb-button-danger" onClick={() => onCommand("lock")} disabled={selected.deviceId !== TRACKER_ID || !telemetry?.deviceOwner}><LockKeyhole size={15} /> Lock kios</button><button className="smb-button-outline" onClick={() => onCommand("unlock")} disabled={selected.deviceId !== TRACKER_ID || !selected.online}><UnlockKeyhole size={15} /> Buka kios</button><button className="smb-button-outline" disabled title="Kamera jarak jauh tidak diaktifkan; Android mensyaratkan penggunaan yang terlihat dan persetujuan di perangkat."><EyeOff size={15} /> Kamera tidak tersedia</button></div>{selected.deviceId !== TRACKER_ID && <div className="smb-info-note"><AlertTriangle size={16} /><span>Command pilot saat ini hanya diaktifkan untuk tracker {TRACKER_ID}.</span></div>}<div className="smb-info-note"><ShieldCheck size={16} /><span>Pelacakan memakai izin Android dan notifikasi layanan yang terlihat. Menyembunyikan aplikasi atau notifikasi tidak didukung.</span></div></section> : <section className="smb-panel smb-device-detail"><EmptyState icon={<Smartphone size={21} />} title="Pilih perangkat" body="Pilih satu baris untuk melihat telemetri dan aksi yang tersedia." /></section>}</div>;
 }
 
 function CommandsPage({ commands, devices, onOpenDevice }: { commands: CommandRow[]; devices: Device[]; onOpenDevice: (id: string) => void }) {
@@ -555,6 +558,75 @@ function ChangePasswordPanel({ apiBase, token }: { apiBase: string; token: strin
     {message && <div className="smb-admin-feedback is-success">{message}</div>}
     {error && <div className="smb-admin-feedback is-error">{error}</div>}
   </section>;
+}
+
+type TelegramAccess = { chatId: string; role: "owner" | "operator"; grantedAt: string; grantedBy: string; revokedAt: string | null };
+type TelegramOtpRecord = { issuedBy: string; createdAt: string; expiresAt: string; usedAt: string | null; usedByChatId: string | null };
+
+function TelegramAccessPage({ apiBase, token }: { apiBase: string; token: string }) {
+  const [accesses, setAccesses] = useState<TelegramAccess[]>([]);
+  const [codes, setCodes] = useState<TelegramOtpRecord[]>([]);
+  const [telegramConfigured, setTelegramConfigured] = useState(false);
+  const [issuedCode, setIssuedCode] = useState("");
+  const [expiresAt, setExpiresAt] = useState("");
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = async () => {
+    try {
+      const response = await fetch(`${apiBase}/api/admin/telegram/access`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "Akses Telegram gagal dimuat.");
+      setAccesses(data.accesses as TelegramAccess[]);
+      setCodes(data.codes as TelegramOtpRecord[]);
+      setTelegramConfigured(Boolean(data.telegramConfigured));
+      setError("");
+    } catch (loadError) { setError(loadError instanceof Error ? loadError.message : "Koneksi broker gagal."); }
+  };
+  useEffect(() => { void load(); }, [apiBase, token]);
+  const issue = async () => {
+    if (busy) return;
+    setBusy(true); setError(""); setNotice(""); setIssuedCode("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/telegram/otp`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "OTP tidak dapat dibuat.");
+      setIssuedCode(data.code); setExpiresAt(data.expiresAt); setNotice(data.message);
+      await load();
+    } catch (issueError) { setError(issueError instanceof Error ? issueError.message : "Pembuatan OTP gagal."); }
+    finally { setBusy(false); }
+  };
+  const revoke = async (access: TelegramAccess) => {
+    if (access.role === "owner" || !window.confirm(`Cabut akses Telegram untuk chat ${access.chatId}?`)) return;
+    setError(""); setNotice("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/telegram/access/${encodeURIComponent(access.chatId)}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "Akses tidak dapat dicabut.");
+      setNotice(data.message); await load();
+    } catch (revokeError) { setError(revokeError instanceof Error ? revokeError.message : "Pencabutan akses gagal."); }
+  };
+  const copyCode = async () => {
+    try { await navigator.clipboard.writeText(`/start ${issuedCode}`); setNotice("Perintah OTP disalin."); }
+    catch { setError("Clipboard tidak tersedia. Salin perintah yang tampil secara manual."); }
+  };
+  return <div className="smb-telegram-access-page">
+    <section className="smb-panel smb-telegram-otp-panel">
+      <PanelHeading kicker="OTORISASI TELEGRAM" title="Buat OTP sekali pakai" />
+      <p className="smb-admin-help">OTP dibuat oleh broker lokal setelah sesi superadmin terverifikasi. Kode berlaku 10 menit, hanya dapat dipakai satu chat, dan memberi akses ke perintah bot yang tersedia. Jangan kirim kode ke chat yang tidak dikenal.</p>
+      <div className="smb-telegram-otp-state"><span className={`smb-status-pill ${telegramConfigured ? "status-on" : "status-off"}`}><i />{telegramConfigured ? "BOT DIKONFIGURASI" : "BOT BELUM DIKONFIGURASI"}</span><button className="smb-button-primary" onClick={() => void issue()} disabled={busy || !telegramConfigured}>{busy ? "Membuat OTP…" : "Buat OTP baru"}</button></div>
+      {issuedCode && <div className="smb-telegram-issued-code"><small>KODE HANYA DITAMPILKAN PADA SESI INI · HABIS {formatTime(expiresAt)}</small><code>/start {issuedCode}</code><button className="smb-button-muted" onClick={() => void copyCode()}>Salin perintah</button></div>}
+      {notice && <div className="smb-admin-feedback is-success">{notice}</div>}
+      {error && <div className="smb-admin-feedback is-error">{error}</div>}
+      <div className="smb-info-note"><ShieldCheck size={16} /><span>Pemegang OTP dapat memakai perintah bot aktif, termasuk lock/unlock tracker pilot. Cabut chat dari daftar akses setelah keperluan berakhir. Pengambilan kamera jarak jauh tidak tersedia.</span></div>
+    </section>
+    <section className="smb-panel smb-admin-list-panel">
+      <PanelHeading kicker="CHAT BERWENANG" title={`${accesses.filter((item) => !item.revokedAt).length} akses aktif`} action={<button className="smb-text-link" onClick={() => void load()}><RefreshCw size={14} /> Segarkan</button>} />
+      <div className="smb-admin-list">{accesses.map((access) => <div className="smb-admin-row" key={access.chatId}><div className="smb-admin-avatar"><Bot size={17} /></div><div className="smb-admin-account"><strong>Chat {access.chatId}</strong><small>{access.role === "owner" ? "Owner dari konfigurasi server" : `OTP oleh ${access.grantedBy}`} · {formatTime(access.grantedAt)}</small></div><span className={`smb-status-pill ${access.revokedAt ? "status-off" : "status-on"}`}>{access.revokedAt ? "DICABUT" : access.role === "owner" ? "OWNER" : "AKTIF"}</span>{access.role === "operator" && !access.revokedAt && <button className="smb-button-muted" onClick={() => void revoke(access)}>Cabut</button>}</div>)}
+        {accesses.length === 0 && <EmptyState icon={<Bot size={21} />} title="Belum ada chat terdaftar" body="Chat owner ditambahkan dari TELEGRAM_ADMIN_CHAT_ID. Chat lain masuk setelah menukar OTP." />}</div>
+    </section>
+    <section className="smb-panel smb-telegram-code-history"><PanelHeading kicker="RIWAYAT KODE" title="OTP terbaru" /><div className="smb-telegram-code-list">{codes.map((code) => <div key={`${code.createdAt}-${code.issuedBy}`}><span className={`smb-status-pill ${code.usedAt ? "status-on" : new Date(code.expiresAt) > new Date() ? "status-off" : "status-off"}`}>{code.usedAt ? `DIPAKAI · ${code.usedByChatId}` : new Date(code.expiresAt) > new Date() ? "BELUM DIPAKAI" : "KEDALUWARSA"}</span><small>Dibuat {formatTime(code.createdAt)} · oleh {code.issuedBy}</small></div>)}{codes.length === 0 && <p className="smb-admin-help">Belum ada OTP yang dibuat.</p>}</div></section>
+  </div>;
 }
 
 type AdminAccount = { id: number; username: string; role: "superadmin" | "staff"; totpEnabled: boolean; createdAt: string };

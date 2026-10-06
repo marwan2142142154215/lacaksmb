@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { DatabaseSync } from "node:sqlite";
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, randomInt } from "node:crypto";
 import {
   bootstrapFirstAdmin,
   completeTotpEnrollment,
@@ -109,10 +109,17 @@ database.exec(`
   CREATE TABLE IF NOT EXISTS command_log (id TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(device_id), command TEXT NOT NULL, issued_by TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, sent_at TEXT, completed_at TEXT, detail TEXT);
   CREATE TABLE IF NOT EXISTS telemetry_minute (device_id TEXT NOT NULL REFERENCES devices(device_id), minute_at TEXT NOT NULL, sample_count INTEGER NOT NULL, detected_count INTEGER NOT NULL, rssi_sum INTEGER NOT NULL, rssi_count INTEGER NOT NULL, rssi_min INTEGER, rssi_max INTEGER, battery_level INTEGER, PRIMARY KEY (device_id, minute_at));
   CREATE TABLE IF NOT EXISTS location_history (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE, captured_at TEXT NOT NULL, received_at TEXT NOT NULL, nonce TEXT NOT NULL, coordinates_enc TEXT NOT NULL, UNIQUE(device_id, captured_at));
+  CREATE TABLE IF NOT EXISTS telegram_chat_access (chat_id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('owner','operator')), granted_at TEXT NOT NULL, granted_by TEXT NOT NULL, revoked_at TEXT);
+  CREATE TABLE IF NOT EXISTS telegram_access_codes (code_hash TEXT PRIMARY KEY, issued_by TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, used_by_chat_id TEXT);
+  CREATE TABLE IF NOT EXISTS telegram_otp_attempts (chat_id TEXT PRIMARY KEY, window_started_at TEXT NOT NULL, failures INTEGER NOT NULL DEFAULT 0);
   CREATE INDEX IF NOT EXISTS command_log_device_created ON command_log(device_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS telemetry_minute_recent ON telemetry_minute(device_id, minute_at DESC);
   CREATE INDEX IF NOT EXISTS location_history_recent ON location_history(device_id, captured_at DESC);
 `);
+if (telegramAdminChatId) {
+  database.prepare("INSERT INTO telegram_chat_access (chat_id,role,granted_at,granted_by,revoked_at) VALUES (?,'owner',?,'environment',NULL) ON CONFLICT(chat_id) DO UPDATE SET role='owner',revoked_at=NULL")
+    .run(telegramAdminChatId, new Date().toISOString());
+}
 ensureAdminAuthSchema(database);
 const bootstrapCreated = bootstrapFirstAdmin(
   database,
@@ -244,7 +251,7 @@ const server = https.createServer({
   ]);
   if (allowedOrigins.has(origin)) {
     response.setHeader("access-control-allow-origin", origin);
-    response.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
+    response.setHeader("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
     response.setHeader("access-control-allow-headers", "Authorization,Content-Type");
     response.setHeader("vary", "Origin");
   }
@@ -342,6 +349,43 @@ const server = https.createServer({
     const admin = requireAdminSession(request, response);
     if (!admin) return;
     respondJson(response, 200, { generatedAt: new Date().toISOString(), broker: { status: "online", host, port }, logs: readOperationLogs() });
+    return;
+  }
+  if (request.method === "GET" && request.url === "/api/admin/telegram/access") {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden" }); return; }
+    const accesses = database.prepare("SELECT chat_id AS chatId,role,granted_at AS grantedAt,granted_by AS grantedBy,revoked_at AS revokedAt FROM telegram_chat_access ORDER BY granted_at DESC").all();
+    const codes = database.prepare("SELECT issued_by AS issuedBy,created_at AS createdAt,expires_at AS expiresAt,used_at AS usedAt,used_by_chat_id AS usedByChatId FROM telegram_access_codes WHERE created_at>? ORDER BY created_at DESC LIMIT 20").all(new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString());
+    respondJson(response, 200, { telegramConfigured: Boolean(telegramToken), accesses, codes });
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/admin/telegram/otp") {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden" }); return; }
+    if (!telegramToken) { respondJson(response, 503, { error: "telegram_unconfigured", message: "Telegram bot belum dikonfigurasi pada broker PC." }); return; }
+    const code = String(randomInt(10_000_000, 100_000_000));
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 10 * 60_000).toISOString();
+    database.prepare("UPDATE telegram_access_codes SET expires_at=? WHERE used_at IS NULL").run(now.toISOString());
+    database.prepare("DELETE FROM telegram_access_codes WHERE created_at<?").run(new Date(now.getTime() - 30 * 24 * 60 * 60_000).toISOString());
+    database.prepare("INSERT INTO telegram_access_codes (code_hash,issued_by,created_at,expires_at) VALUES (?,?,?,?)")
+      .run(tokenDigest(code), admin.username, now.toISOString(), expiresAt);
+    respondJson(response, 201, { code, expiresAt, message: "OTP hanya ditampilkan sekali. Berlaku 10 menit dan hanya dapat dipakai satu chat Telegram." });
+    return;
+  }
+  const revokeTelegramAccess = request.method === "DELETE" && request.url.match(/^\/api\/admin\/telegram\/access\/(-?\d+)$/);
+  if (revokeTelegramAccess) {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden" }); return; }
+    const chatId = revokeTelegramAccess[1];
+    if (chatId === telegramAdminChatId) { respondJson(response, 400, { error: "cannot_revoke_owner", message: "Chat owner dari konfigurasi server tidak dapat dicabut dari dashboard." }); return; }
+    const result = database.prepare("UPDATE telegram_chat_access SET revoked_at=? WHERE chat_id=? AND role='operator' AND revoked_at IS NULL")
+      .run(new Date().toISOString(), chatId);
+    if (!result.changes) { respondJson(response, 404, { error: "access_not_found" }); return; }
+    respondJson(response, 200, { ok: true, message: "Akses Telegram dicabut." });
     return;
   }
   const downloadMatch = request.method === "GET" && request.url.match(/^\/api\/admin\/downloads\/(tracker|master|server)$/);
@@ -779,6 +823,7 @@ function acknowledge(commandId, ok, detail, sourceDeviceId) {
     .run(entry.status, entry.completedAt, entry.detail, entry.id);
   queueSupabaseCommand(entry);
   console.log(`Command ${commandId} ${entry.status}: ${detail || "no detail"}`);
+  if (["lock", "unlock"].includes(entry.command)) void notifyTelegramCommand(entry).catch((error) => console.error("Telegram command notification failed:", error.message));
   const queue = queues.get(entry.deviceId) || [];
   queues.set(entry.deviceId, queue.filter((queued) => queued.id !== commandId));
   sendToMasters({ type: "commandUpdate", command: entry });
@@ -808,17 +853,77 @@ async function telegramCall(method, body) {
 async function telegramReply(chatId, text) {
   return telegramCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
 }
+async function notifyTelegramCommand(entry) {
+  if (!telegramToken) return;
+  const sourceChat = String(entry.issuedBy || "").match(/^telegram:(-?\d+)$/)?.[1];
+  const chatId = sourceChat || telegramAdminChatId;
+  if (!chatId) return;
+  const device = devices.get(entry.deviceId);
+  const locationText = entry.deviceId === TRACKER_ID && Number.isFinite(latestTelemetry.latitude) && Number.isFinite(latestTelemetry.longitude)
+    ? `\nLokasi terakhir: https://maps.google.com/?q=${latestTelemetry.latitude},${latestTelemetry.longitude} (akurasi ±${Number.isFinite(latestTelemetry.accuracyMeters) ? Math.round(latestTelemetry.accuracyMeters) : "?"} m; ${latestTelemetry.locationAt || "waktu tidak tersedia"})`
+    : "\nLokasi: belum ada koordinat aktual yang dilaporkan.";
+  await telegramReply(chatId, `${entry.command === "lock" ? "KUNCI" : "BUKA KIOS"} ${entry.status === "acked" ? "berhasil" : "gagal"}\nPerangkat: ${device?.name || "perangkat"} (${entry.deviceId})\nHasil Android: ${entry.detail || entry.status}${locationText}`);
+}
+
+function redeemTelegramOtp(code, chatId) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const attempt = database.prepare("SELECT window_started_at AS windowStartedAt,failures FROM telegram_otp_attempts WHERE chat_id=?").get(chatId);
+  const windowStart = attempt ? new Date(attempt.windowStartedAt) : null;
+  if (attempt && windowStart && now.getTime() - windowStart.getTime() < 15 * 60_000 && attempt.failures >= 5) return "throttled";
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const row = database.prepare("SELECT code_hash AS codeHash,issued_by AS issuedBy FROM telegram_access_codes WHERE code_hash=? AND used_at IS NULL AND expires_at>?").get(tokenDigest(code), nowIso);
+    if (!row) {
+      const currentWindow = attempt && windowStart && now.getTime() - windowStart.getTime() < 15 * 60_000 ? attempt.windowStartedAt : nowIso;
+      const failures = currentWindow === attempt?.windowStartedAt ? attempt.failures + 1 : 1;
+      database.prepare("INSERT INTO telegram_otp_attempts (chat_id,window_started_at,failures) VALUES (?,?,?) ON CONFLICT(chat_id) DO UPDATE SET window_started_at=excluded.window_started_at,failures=excluded.failures")
+        .run(chatId, currentWindow, failures);
+      database.exec("COMMIT");
+      return "invalid";
+    }
+    database.prepare("INSERT INTO telegram_chat_access (chat_id,role,granted_at,granted_by,revoked_at) VALUES (?,'operator',?,?,NULL) ON CONFLICT(chat_id) DO UPDATE SET role=CASE WHEN telegram_chat_access.role='owner' THEN 'owner' ELSE 'operator' END,granted_at=excluded.granted_at,granted_by=excluded.granted_by,revoked_at=NULL")
+      .run(chatId, nowIso, row.issuedBy);
+    const used = database.prepare("UPDATE telegram_access_codes SET used_at=?,used_by_chat_id=? WHERE code_hash=? AND used_at IS NULL")
+      .run(nowIso, chatId, row.codeHash);
+    if (!used.changes) { database.exec("ROLLBACK"); return "invalid"; }
+    database.prepare("DELETE FROM telegram_otp_attempts WHERE chat_id=?").run(chatId);
+    database.exec("COMMIT");
+    return "accepted";
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 async function handleTelegramUpdate(update) {
   const message = update.message;
   if (!message?.text) return;
   const chatId = String(message.chat?.id || "");
-  if (chatId !== telegramAdminChatId) {
-    console.warn(`Rejected Telegram command from non-whitelisted chat ${chatId}`);
+  if (message.chat?.type !== "private") {
+    console.warn(`Rejected Telegram command outside private chat ${chatId}`);
     return;
   }
   const [rawCommand, ...rest] = message.text.trim().split(/\s+/);
   const command = rawCommand.split("@")[0].toLowerCase();
   const argument = rest.join(" ");
+  if (command === "/start") {
+    if (/^\d{8}$/.test(argument)) {
+      const redeemed = redeemTelegramOtp(argument, chatId);
+      if (redeemed === "accepted") await telegramReply(chatId, "Akses bot disetujui. Gunakan /daftar, /status <nama>, /lokasi <nama>, /lock <nama>, atau /unlock <nama>. Akses ini dapat dicabut dari dashboard.");
+      else await telegramReply(chatId, redeemed === "throttled" ? "Terlalu banyak OTP salah. Tunggu 15 menit sebelum mencoba lagi." : "OTP tidak valid atau sudah kedaluwarsa. Minta kode baru kepada admin.");
+      return;
+    }
+    const known = database.prepare("SELECT 1 FROM telegram_chat_access WHERE chat_id=? AND revoked_at IS NULL").get(chatId);
+    await telegramReply(chatId, known ? "Bot SMB Fleet aktif. Gunakan /daftar, /status <nama>, /lokasi <nama>, /lock <nama>, atau /unlock <nama>." : "Akses bot dibatasi. Minta OTP satu kali dari admin, lalu kirim /start <OTP> dalam 10 menit.");
+    return;
+  }
+  const access = database.prepare("SELECT role FROM telegram_chat_access WHERE chat_id=? AND revoked_at IS NULL").get(chatId);
+  if (!access) {
+    console.warn(`Rejected Telegram command from unauthorized chat ${chatId}: ${command}`);
+    if (command.startsWith("/")) await telegramReply(chatId, "Akses bot belum diberikan. Minta OTP satu kali dari admin, lalu kirim /start <OTP>.");
+    return;
+  }
   if (command === "/daftar") {
     const lines = publicDevices().map((d) => `${d.name} (${d.deviceId}) — ${d.online ? "online" : "offline"}`);
     await telegramReply(chatId, lines.join("\n") || "Belum ada perangkat terdaftar.");
@@ -830,7 +935,10 @@ async function handleTelegramUpdate(update) {
     const [deviceId, device] = match;
     if (deviceId === "R9RXC03EC9N") {
       const proximity = latestTelemetry.online && latestTelemetry.detected ? `BLE terdeteksi, ${latestTelemetry.rssi} dBm` : "BLE belum terdeteksi";
-      await telegramReply(chatId, `${device.name} (${deviceId})\nStatus: ${device.connected ? "online" : "offline"}\nLokasi: hanya kedekatan BLE (${proximity}); koordinat GPS tidak digunakan.`);
+      const coords = Number.isFinite(latestTelemetry.latitude) && Number.isFinite(latestTelemetry.longitude)
+        ? `Lokasi: ${latestTelemetry.latitude}, ${latestTelemetry.longitude}\nPeta: https://maps.google.com/?q=${latestTelemetry.latitude},${latestTelemetry.longitude}\nAkurasi: ±${Number.isFinite(latestTelemetry.accuracyMeters) ? Math.round(latestTelemetry.accuracyMeters) : "?"} m · ${latestTelemetry.locationAt || "waktu tidak tersedia"}`
+        : `Lokasi GPS: belum dilaporkan. Kedekatan BLE: ${proximity}.`;
+      await telegramReply(chatId, `${device.name} (${deviceId})\nStatus: ${device.connected ? "online" : "offline"}\nBaterai: ${latestTelemetry.batteryLevel == null ? "belum dilaporkan" : `${latestTelemetry.batteryLevel}%`}\n${coords}`);
     } else {
       await telegramReply(chatId, `${device.name} (${deviceId})\nStatus: ${device.connected ? "online" : "offline"}\nTelemetri baterai/lokasi belum tersedia.`);
     }
@@ -853,7 +961,7 @@ async function handleTelegramUpdate(update) {
   if (["/lock", "/unlock"].includes(command)) {
     const match = findDevice(argument);
     if (!match || match[0] !== "R9RXC03EC9N") { await telegramReply(chatId, match ? `Perintah ini hanya diizinkan untuk tracker R9RXC03EC9N, bukan ${match[0]}.` : candidateReply(argument)); return; }
-    const queued = enqueueCommand(match[0], command.slice(1), "telegram");
+    const queued = enqueueCommand(match[0], command.slice(1), `telegram:${chatId}`);
     await telegramReply(chatId, `Perintah ${command.slice(1)} masuk antrean FIFO untuk ${match[1].name}. ID: ${queued.id}. Hasil menunggu ACK dari HP.`);
     return;
   }
