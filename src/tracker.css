@@ -80,3 +80,23 @@
 .tracker-lock-status { margin-top: 24px; padding: 10px 13px; display: flex; align-items: center; gap: 8px; color: #d7efe3; background: #ffffff12; border-radius: 999px; font-size: 10px; }
 .tracker-lock-screen small { margin-top: 13px; color: #8db0a1; font-size: 9px; }
 @media (min-width: 640px) { .tracker-shell { padding-top: 34px; } .tracker-intro { margin-top: 45px; } .tracker-signal-card { padding: 24px; } }
+
+/* -- Enrolmen site ----------------------------------------------------------- */
+.tracker-enroll-form { max-width: 560px; margin: 16px auto 0; padding: 18px; display: flex; flex-direction: column; gap: 8px; background: #fff; border: 1px solid #e7edf0; border-radius: 16px; }
+.tracker-enroll-form label { color: #65777b; font-size: 10px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
+.tracker-enroll-input { padding: 12px 14px; border: 1px solid #d8e2e6; border-radius: 11px; font: 700 17px/1.2 "Manrope", sans-serif; letter-spacing: 3px; text-transform: uppercase; color: #16313a; background: #f9fbfc; }
+.tracker-enroll-input:focus { outline: 2px solid #10b981; outline-offset: 1px; }
+.tracker-enroll-form button[type="submit"] { margin-top: 6px; padding: 13px; border: 0; border-radius: 11px; background: #10b981; color: #04231a; font: 800 13px/1 "Manrope", sans-serif; letter-spacing: .4px; cursor: pointer; }
+.tracker-enroll-form button[type="submit"]:disabled { opacity: .55; cursor: not-allowed; }
+.tracker-enroll-error { color: #d64545; font-size: 11px; }
+.tracker-enroll-ok { color: #10b981; font-size: 11px; }
+.tracker-enroll-note { margin-top: 4px; color: #8b9ba0; font-size: 10px; line-height: 1.6; }
+.tracker-enroll-note code { color: #16313a; word-break: break-all; }
+.tracker-enroll-reset { margin-top: 8px; padding: 0; border: 0; background: none; color: #d64545; font-size: 10px; text-decoration: underline; cursor: pointer; }
+
+/* -- Kartu site / status blokir hapus --------------------------------------- */
+.tracker-site-card { max-width: 560px; margin: 12px auto 0; padding: 11px 13px; display: flex; align-items: center; gap: 9px; color: #4a6169; background: #f2f7f9; border: 1px solid #e2ecef; border-radius: 12px; font-size: 11px; }
+.tracker-site-card svg { flex: 0 0 auto; color: #2f8f9d; }
+.tracker-site-card span:nth-child(2) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tracker-site-block { padding: 4px 9px; border-radius: 999px; font-size: 9px; font-weight: 700; letter-spacing: .4px; background: #e7f7ef; color: #0f8b57; white-space: nowrap; }
+.tracker-site-block.is-blocked { background: #fdecec; color: #c93b3b; }

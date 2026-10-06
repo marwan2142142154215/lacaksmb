@@ -1,4 +1,4 @@
-package id.nusarental.fleetconsole;
+package com.smbbotlacak.tracker;
 
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -13,15 +13,26 @@ public final class ProximityBootReceiver extends BroadcastReceiver {
 
     @Override
     public void onReceive(Context context, Intent received) {
-        if (received == null || !Intent.ACTION_BOOT_COMPLETED.equals(received.getAction())) return;
+        if (received == null) return;
+        String action = received.getAction();
+        boolean isValidTrigger = Intent.ACTION_BOOT_COMPLETED.equals(action)
+            || Intent.ACTION_LOCKED_BOOT_COMPLETED.equals(action)
+            || Intent.ACTION_MY_PACKAGE_REPLACED.equals(action);
+        if (!isValidTrigger) return;
 
         SharedPreferences preferences = context.getSharedPreferences("smb_proximity", Context.MODE_PRIVATE);
-        if (!preferences.getBoolean("requested", false)) return;
+        String storedToken = preferences.getString(ProximityForegroundService.EXTRA_TOKEN, "");
+        // Perangkat yang belum menyelesaikan enrolmen site tidak punya token;
+        // jangan jalankan service dengan kredensial pura-pura.
+        if (storedToken.isEmpty()) {
+            Log.d(TAG, "Skip service restart: enrollment token missing.");
+            return;
+        }
 
         Intent service = new Intent(context, ProximityForegroundService.class)
             .setAction(ProximityForegroundService.ACTION_START)
-            .putExtra(ProximityForegroundService.EXTRA_BROKER_URL, preferences.getString(ProximityForegroundService.EXTRA_BROKER_URL, ""))
-            .putExtra(ProximityForegroundService.EXTRA_TOKEN, preferences.getString(ProximityForegroundService.EXTRA_TOKEN, ""))
+            .putExtra(ProximityForegroundService.EXTRA_BROKER_URL, preferences.getString(ProximityForegroundService.EXTRA_BROKER_URL, "wss://broker.lacaksmbbot.com/ws"))
+            .putExtra(ProximityForegroundService.EXTRA_TOKEN, storedToken)
             .putExtra(ProximityForegroundService.EXTRA_DEVICE_ID, preferences.getString(ProximityForegroundService.EXTRA_DEVICE_ID, ""))
             .putExtra(ProximityForegroundService.EXTRA_MASTER_ID, preferences.getString(ProximityForegroundService.EXTRA_MASTER_ID, "R9RY506354P"))
             .putExtra(ProximityForegroundService.EXTRA_MODE, preferences.getString(ProximityForegroundService.EXTRA_MODE, "scan"));
@@ -32,6 +43,7 @@ public final class ProximityBootReceiver extends BroadcastReceiver {
 
         try {
             ContextCompat.startForegroundService(context, service);
+            Log.d(TAG, "ProximityForegroundService started on trigger: " + action);
         } catch (RuntimeException error) {
             Log.e(TAG, "Android blocked BLE service restart at boot", error);
         }

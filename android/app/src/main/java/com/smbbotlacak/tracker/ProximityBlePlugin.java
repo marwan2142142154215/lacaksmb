@@ -1,4 +1,4 @@
-package id.nusarental.fleetconsole;
+package com.smbbotlacak.tracker;
 
 import android.Manifest;
 import android.content.BroadcastReceiver;
@@ -28,7 +28,8 @@ import com.getcapacitor.annotation.PermissionCallback;
         @Permission(alias = "legacyLocation", strings = { Manifest.permission.ACCESS_FINE_LOCATION }),
         @Permission(alias = "location", strings = { Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION }),
         @Permission(alias = "backgroundLocation", strings = { Manifest.permission.ACCESS_BACKGROUND_LOCATION }),
-        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS })
+        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS }),
+        @Permission(alias = "camera", strings = { Manifest.permission.CAMERA })
     }
 )
 public class ProximityBlePlugin extends Plugin {
@@ -195,14 +196,30 @@ public class ProximityBlePlugin extends Plugin {
             call.reject("Izin perangkat sekitar belum diberikan.", "BLE_PERMISSION_REQUIRED");
             return;
         }
-        startForegroundMode(call, "scan", "R9RXC03EC9N");
+        // ID perangkat diambil dari hasil enrolmen; fallback ke ANDROID_ID.
+        startForegroundMode(call, "scan", androidId());
+    }
+
+    @PluginMethod
+    public void getDeviceId(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("deviceId", androidId());
+        call.resolve(result);
+    }
+
+    private String androidId() {
+        String value = android.provider.Settings.Secure.getString(
+            getContext().getContentResolver(), android.provider.Settings.Secure.ANDROID_ID);
+        return value == null || value.isEmpty() ? "pending-enrollment" : value;
     }
 
     private void startForegroundMode(PluginCall call, String mode, String fallbackId) {
-        String brokerUrl = call.getString("brokerUrl", "wss://192.168.100.118:8787/ws");
-        String token = call.getString("token", "");
-        String deviceId = call.getString("deviceId", fallbackId);
-        String masterId = call.getString("masterId", "R9RY506354P");
+        String brokerUrl         = call.getString("brokerUrl", "wss://broker.lacaksmbbot.com/ws");
+        String lanBrokerUrl      = call.getString("lanBrokerUrl", "");
+        String token             = call.getString("token", "");
+        String deviceId          = call.getString("deviceId", fallbackId);
+        String masterId          = call.getString("masterId", "R9RY506354P");
+
         if ("scan".equals(mode) && (token.isEmpty() || !brokerUrl.startsWith("wss://"))) {
             call.reject("Broker WSS dan token unik perangkat belum dikonfigurasi.", "BROKER_CONFIG_REQUIRED");
             return;
@@ -210,6 +227,7 @@ public class ProximityBlePlugin extends Plugin {
         Intent intent = new Intent(getContext(), ProximityForegroundService.class);
         intent.setAction(ProximityForegroundService.ACTION_START);
         intent.putExtra(ProximityForegroundService.EXTRA_BROKER_URL, brokerUrl);
+        intent.putExtra(ProximityForegroundService.EXTRA_LAN_BROKER_URL, lanBrokerUrl);
         intent.putExtra(ProximityForegroundService.EXTRA_TOKEN, token);
         intent.putExtra(ProximityForegroundService.EXTRA_DEVICE_ID, deviceId);
         intent.putExtra(ProximityForegroundService.EXTRA_MASTER_ID, masterId);

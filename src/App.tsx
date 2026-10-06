@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
-  Activity, AlertTriangle, ArrowUpRight, Battery, Bluetooth, Bot, Check, ChevronRight,
-  CircleAlert, Clock3, Command, Download, EyeOff, FileText, HardDriveDownload, LayoutDashboard, ListChecks, LockKeyhole,
-  LogOut, MapPin, MapPinOff, Menu, Network, Pencil, PlugZap, Radio, RefreshCw, Search, Server,
-  Settings2, ShieldCheck, Smartphone, UnlockKeyhole, Users, Wifi, X,
+  Activity, AlertTriangle, ArrowUpRight, Battery, Bluetooth, Bot, Building2, Check, ChevronRight,
+  CircleAlert, Clock3, Command, Copy, Download, EyeOff, FileText, HardDriveDownload, KeyRound, LayoutDashboard, ListChecks,
+  LockKeyhole, LogOut, MapPin, MapPinOff, Menu, Network, Pencil, PlugZap, Radio, RefreshCw, Search, Server,
+  Settings2, ShieldCheck, Smartphone, Trash2, UnlockKeyhole, Users, Wifi, X,
 } from "lucide-react";
 import QRCode from "qrcode";
 import TrackerPage from "./TrackerPage";
@@ -14,16 +14,51 @@ import "./AdminAuth.css";
 
 const MASTER_ID = "R9RY506354P";
 const TRACKER_ID = "R9RXC03EC9N";
-type Page = "overview" | "devices" | "commands" | "proximity" | "policy" | "integrations" | "server" | "settings" | "admins" | "telegram";
+type Page = "overview" | "devices" | "sites" | "commands" | "proximity" | "policy" | "integrations" | "server" | "settings" | "admins" | "telegram";
 type CommandRow = { id: string; deviceId: string; command: string; issuedBy: string; status: string; createdAt: string; completedAt?: string; detail?: string };
-type Device = { deviceId: string; name: string; role?: string; online: boolean; lastSeenAt?: string | null; telemetry?: PilotTelemetry | null };
+type Site = { id: number; name: string; wifiAllowlist: string[]; createdAt: string; updatedAt: string };
+type Device = { deviceId: string; name: string; role?: string; online: boolean; lastSeenAt?: string | null; siteId?: number | null; siteName?: string | null; wifiSsid?: string | null; uninstallBlocked?: boolean; telemetry?: PilotTelemetry | null };
 type SignalSample = { minuteAt: string; sampleCount: number; detectedCount: number; rssiAvg: number | null; rssiMin: number | null; rssiMax: number | null; batteryLevel: number | null };
 type LocationSample = { deviceId: string; latitude: number; longitude: number; accuracyMeters: number | null; locationProvider: string; locationAt: string; receivedAt: string };
-type Snapshot = { generatedAt: string; devices: Device[]; telemetry: PilotTelemetry | null; locationHistory: LocationSample[]; signalHistory: SignalSample[]; commands: CommandRow[]; telegram: { configured: boolean }; supabase: { configured: boolean } };
+type Snapshot = { generatedAt: string; devices: Device[]; telemetry: PilotTelemetry | null; telemetryByDevice?: Record<string, PilotTelemetry | null>; sites?: Site[]; lanBrokerUrl?: string; locationHistory: LocationSample[]; signalHistory: SignalSample[]; commands: CommandRow[]; telegram: { configured: boolean }; supabase: { configured: boolean } };
 
-const navigation: Array<{ id: Page; title: string; icon: typeof LayoutDashboard; group?: string }> = [
+function newestTelemetry(cached?: PilotTelemetry | null, live?: PilotTelemetry | null) {
+  if (!live) return cached ?? null;
+  if (!cached) return live;
+  const cachedAt = Date.parse(cached.receivedAt || "");
+  const liveAt = Date.parse(live.receivedAt || "");
+  return !Number.isFinite(cachedAt) || (Number.isFinite(liveAt) && liveAt >= cachedAt) ? live : cached;
+}
+
+function mergeDevices(cached: Device[], live: Device[]) {
+  const cachedById = new Map(cached.map((device) => [device.deviceId, device]));
+  const liveById = new Map(live.map((device) => [device.deviceId, device]));
+  const ids = new Set([...cachedById.keys(), ...liveById.keys()]);
+  return [...ids].flatMap((deviceId) => {
+    const oldDevice = cachedById.get(deviceId);
+    const liveDevice = liveById.get(deviceId);
+    const base = liveDevice || oldDevice;
+    if (!base) return [];
+    return [{
+      ...oldDevice,
+      ...base,
+      online: liveDevice ? liveDevice.online : Boolean(oldDevice?.online),
+      lastSeenAt: liveDevice?.lastSeenAt || oldDevice?.lastSeenAt || null,
+      telemetry: newestTelemetry(oldDevice?.telemetry, liveDevice?.telemetry),
+    }];
+  });
+}
+
+function lockModeLabel(mode?: number | null) {
+  if (mode === 1) return "Kios terkelola aktif";
+  if (mode === 2) return "Semat layar Android";
+  return "Tidak aktif";
+}
+
+const navigation: Array<{ id: Page; title: string; icon: typeof LayoutDashboard; group?: string; superadminOnly?: boolean }> = [
   { id: "overview", title: "Ringkasan", icon: LayoutDashboard },
   { id: "devices", title: "Kelola perangkat", icon: Smartphone, group: "ARMADA" },
+  { id: "sites", title: "Site & tim", icon: Building2, superadminOnly: true },
   { id: "commands", title: "Antrean perintah", icon: ListChecks },
   { id: "proximity", title: "Kedekatan BLE", icon: Bluetooth, group: "KONTROL" },
   { id: "policy", title: "Kebijakan Android", icon: ShieldCheck },
@@ -36,6 +71,7 @@ const navigation: Array<{ id: Page; title: string; icon: typeof LayoutDashboard;
 const pageTitles: Record<Page, { title: string; description: string }> = {
   overview: { title: "Ringkasan armada", description: "Kondisi perangkat yang dilaporkan langsung ke broker lokal." },
   devices: { title: "Kelola perangkat", description: "Pilih satu perangkat dan pastikan ID target sebelum mengirim perintah." },
+  sites: { title: "Site & tim", description: "Kelola site/tim, daftar WiFi izinan, dan kode enrolmen untuk APK Lacak." },
   commands: { title: "Antrean perintah", description: "Riwayat broker tersimpan di SQLite pada PC ini." },
   proximity: { title: "Kedekatan BLE", description: "Status pemindaian beacon aktual. RSSI bukan pengukuran jarak meter." },
   policy: { title: "Kebijakan Android", description: "Status Device Owner dan batasan lock task yang dilaporkan tracker." },
@@ -194,13 +230,13 @@ function AdminGate({ apiBase }: { apiBase: string }) {
 }
 
 function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser: AdminIdentity; apiBase: string }) {
-  const broker = usePilotBroker("master", MASTER_ID, undefined, token);
-  const [page, setPage] = useState<Page>("overview");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const broker = usePilotBroker("master", MASTER_ID, undefined, token, snapshot?.lanBrokerUrl ?? null);
+  const [page, setPage] = useState<Page>("overview");
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState(TRACKER_ID);
   const [notice, setNotice] = useState("");
-  const [confirm, setConfirm] = useState<"lock" | "unlock" | null>(null);
+  const [confirm, setConfirm] = useState<"lock" | "unlock" | "uninstall" | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -209,30 +245,42 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
   const [beaconMessage, setBeaconMessage] = useState("Beacon master belum dinyalakan.");
   const [loading, setLoading] = useState(true);
   const [refreshAt, setRefreshAt] = useState<string | null>(null);
-  const trackerTelemetry = snapshot?.telemetry || broker.telemetry;
+  const trackerTelemetry = newestTelemetry(snapshot?.telemetry, broker.telemetry);
+
+  const lastSnapshotError = useRef("");
+  const refreshSnapshot = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBase}/api/admin/snapshot`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      if (response.status === 401) {
+        // Drop the rejected token so the gate reappears instead of looping
+        // on a 401 every five seconds.
+        clearAdminToken();
+        setNotice("Token admin ditolak broker.");
+        return;
+      }
+      if (!response.ok) throw new Error(`Broker HTTP ${response.status}`);
+      const data = await response.json() as Snapshot;
+      setSnapshot(data);
+      setRefreshAt(data.generatedAt);
+      // Hapus hanya notice yang berasal dari kegagalan snapshot sebelumnya.
+      if (lastSnapshotError.current) {
+        setNotice((current) => (current === lastSnapshotError.current ? "" : current));
+        lastSnapshotError.current = "";
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Snapshot broker belum tersedia.";
+      lastSnapshotError.current = message;
+      setNotice(message);
+    } finally { setLoading(false); }
+  }, [apiBase, token]);
 
   useEffect(() => {
     let active = true;
-    const refresh = async () => {
-      try {
-        const response = await fetch(`${apiBase}/api/admin/snapshot`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
-        if (response.status === 401) {
-          // Drop the rejected token so the gate reappears instead of looping
-          // on a 401 every five seconds.
-          if (active) { clearAdminToken(); setNotice("Token admin ditolak broker."); }
-          return;
-        }
-        if (!response.ok) throw new Error(`Broker HTTP ${response.status}`);
-        const data = await response.json() as Snapshot;
-        if (active) { setSnapshot(data); setRefreshAt(data.generatedAt); setNotice(""); }
-      } catch (error) {
-        if (active) setNotice(error instanceof Error ? error.message : "Snapshot broker belum tersedia.");
-      } finally { if (active) setLoading(false); }
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 5000);
+    const run = async () => { if (active) await refreshSnapshot(); };
+    void run();
+    const timer = window.setInterval(() => void run(), 5000);
     return () => { active = false; window.clearInterval(timer); };
-  }, [apiBase, token]);
+  }, [refreshSnapshot]);
 
   useEffect(() => {
     let mounted = true;
@@ -272,9 +320,24 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
     if (renameResult) { setNotice(renameResult.ok ? (renameResult.detail || "Perubahan nama tersimpan.") : (renameResult.error || "Perubahan ditolak broker.")); setRenaming(false); }
   }, [broker.commandUpdates]);
 
-  const devices = snapshot?.devices || broker.devices;
-  const selected = devices.find((device) => device.deviceId === selectedId) || devices.find((device) => device.deviceId === TRACKER_ID);
-  const telemetry = selected?.deviceId === TRACKER_ID ? trackerTelemetry : selected?.telemetry;
+  // Pelanggaran WiFi site/tim muncul realtime tanpa perlu refresh halaman.
+  useEffect(() => {
+    const latest = broker.violations[0];
+    if (!latest) return;
+    setNotice(`⚠️ ${latest.deviceName} terhubung ke WiFi "${latest.wifiSsid}" di luar izin site ${latest.siteName} (${latest.allowedNetworks.join(", ") || "tanpa daftar"}).`);
+  }, [broker.violations]);
+
+  const devices = useMemo(() => mergeDevices(snapshot?.devices || [], broker.devices), [snapshot?.devices, broker.devices]);
+  const selected = devices.find((device) => device.deviceId === selectedId) || devices.find((device) => device.role === "tracker") || devices[0];
+  // Telemetri per perangkat: gabungan snapshot (persisten) + paket WS terbaru.
+  const telemetryFor = useCallback((deviceId?: string) => {
+    if (!deviceId) return null;
+    const live = broker.telemetryById[deviceId] || null;
+    const saved = snapshot?.telemetryByDevice?.[deviceId] || null;
+    if (deviceId === TRACKER_ID) return newestTelemetry(newestTelemetry(saved, live), snapshot?.telemetry ?? null);
+    return newestTelemetry(saved, live);
+  }, [broker.telemetryById, snapshot?.telemetryByDevice, snapshot?.telemetry]);
+  const telemetry = telemetryFor(selected?.deviceId) || (selected?.deviceId === TRACKER_ID ? trackerTelemetry : selected?.telemetry || null);
   const onlineCount = devices.filter((device) => device.online).length;
   const filteredDevices = useMemo(() => devices.filter((device) => `${device.name} ${device.deviceId}`.toLowerCase().includes(search.toLowerCase())), [devices, search]);
   const commands = useMemo(() => {
@@ -287,18 +350,21 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
     return [...joined.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 60);
   }, [snapshot?.commands, broker.commandUpdates]);
 
-  const sendCommand = (command: "lock" | "unlock") => {
-    if (!selected || selected.deviceId !== TRACKER_ID) { setNotice("Target tidak termasuk perangkat tracker yang dipasangkan."); return; }
+  const sendCommand = (command: "lock" | "unlock" | "uninstall") => {
+    if (!selected || selected.role !== "tracker") { setNotice("Target bukan perangkat tracker."); return; }
     if (!broker.connected) { setNotice("Master belum tersambung ke WSS broker."); return; }
     if (command === "lock" && !telemetry?.deviceOwner) { setNotice("Android belum melaporkan Device Owner aktif; perintah tidak dikirim."); return; }
+    if (command === "uninstall" && !selected.online) { setNotice("Perangkat offline; perintah hapus tidak dikirim."); return; }
     broker.send({ type: "commandRequest", targetId: selected.deviceId, command });
-    setNotice(`Perintah ${command} dimasukkan ke broker untuk ${selected.deviceId}. Tunggu ACK Android.`);
+    setNotice(command === "uninstall"
+      ? `Permintaan buka layar hapus dikirim ke ${selected.name} (${selected.deviceId}). Android tetap meminta 1 konfirmasi di HP.`
+      : `Perintah ${command} dimasukkan ke broker untuk ${selected.deviceId}. Tunggu ACK Android.`);
     setConfirm(null);
     setPage("commands");
   };
   const rename = () => {
     const name = renameValue.trim();
-    if (!selected || selected.deviceId !== TRACKER_ID || !name) { setNotice("Masukkan nama baru untuk tracker yang dipilih."); return; }
+    if (!selected || selected.role !== "tracker" || !name) { setNotice("Masukkan nama baru untuk tracker yang dipilih."); return; }
     broker.send({ type: "renameRequest", targetId: selected.deviceId, newName: name });
     setRenameValue("");
     setNotice(`Permintaan nama dikirim untuk ID ${selected.deviceId}. Menunggu konfirmasi server.`);
@@ -318,14 +384,14 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
         <div className="smb-brand"><div className="smb-brand-mark"><Radio size={21} /></div><div><strong>SMB <span>Master</span></strong><small>FLEET CONTROL</small></div><button className="smb-close-sidebar" onClick={() => setSidebarOpen(false)} aria-label="Tutup menu"><X size={18} /></button></div>
         <div className="smb-master-card"><div className="smb-avatar">SM</div><div><strong>Master utama</strong><span>ID {MASTER_ID}</span></div><span className={`smb-presence ${broker.connected ? "is-online" : ""}`} title={broker.connected ? "Tersambung" : "Terputus"} /></div>
         <nav className="smb-navigation" aria-label="Navigasi utama">
-          {navigation.filter((item) => (item.id !== "admins" && item.id !== "telegram") || adminUser.role === "superadmin").map((item, index) => <div key={item.id}>{item.group && <div className={`smb-nav-group ${index > 0 ? "smb-nav-group-spaced" : ""}`}>{item.group}</div>}<button className={`smb-nav-link ${page === item.id ? "is-active" : ""}`} onClick={() => go(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.title}</span>{item.id === "commands" && commands.filter((row) => row.status === "pending" || row.status === "sent").length > 0 && <b>{commands.filter((row) => row.status === "pending" || row.status === "sent").length}</b>}</button></div>)}
+          {navigation.filter((item) => !item.superadminOnly || adminUser.role === "superadmin").map((item, index) => <div key={item.id}>{item.group && <div className={`smb-nav-group ${index > 0 ? "smb-nav-group-spaced" : ""}`}>{item.group}</div>}<button className={`smb-nav-link ${page === item.id ? "is-active" : ""}`} onClick={() => go(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.title}</span>{item.id === "commands" && commands.filter((row) => row.status === "pending" || row.status === "sent").length > 0 && <b>{commands.filter((row) => row.status === "pending" || row.status === "sent").length}</b>}</button></div>)}
         </nav>
         <div className="smb-sidebar-bottom"><div className="smb-broker-indicator"><span className={`smb-live-dot ${broker.connected ? "" : "is-off"}`} /><div><strong>Broker PC</strong><small>{broker.connected ? "Terhubung via WSS TLS" : "Tidak terhubung"}</small></div><Wifi size={16} /></div><div className="smb-sidebar-foot">SMB FLEET · LOCAL BROKER</div></div>
       </aside>
       {sidebarOpen && <button className="smb-sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="Tutup menu" />}
 
       <main className="smb-main">
-        <header className="smb-topbar"><button className="smb-menu-button" aria-label="Buka menu" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button><div className="smb-breadcrumb">SMB Control <ChevronRight size={14} /><span>{currentTitle.title}</span></div><div className="smb-top-actions"><div className={`smb-connection-chip ${broker.connected ? "is-connected" : ""}`}><i />{broker.connected ? "Broker tersambung" : "Broker terputus"}</div><span className="smb-top-divider" /><span className="smb-admin-name">{adminUser.username}</span><button className="smb-logout-button" onClick={logout}><LogOut size={15} />Keluar</button><button className="smb-icon-button" title="Perbarui data" onClick={() => window.location.reload()}><RefreshCw size={17} /></button></div></header>
+        <header className="smb-topbar"><button className="smb-menu-button" aria-label="Buka menu" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button><div className="smb-breadcrumb">SMB Control <ChevronRight size={14} /><span>{currentTitle.title}</span></div><div className="smb-top-actions"><div className={`smb-connection-chip ${broker.connected ? "is-connected" : ""}`}><i />{broker.connected ? "Broker tersambung" : "Broker terputus"}</div><span className="smb-top-divider" /><span className="smb-admin-name">{adminUser.username}</span><button className="smb-logout-button" onClick={logout}><LogOut size={15} />Keluar</button><button className="smb-icon-button" title="Perbarui data" onClick={() => { void refreshSnapshot(); }}><RefreshCw size={17} /></button></div></header>
 
         <div className="smb-content">
           <div className="smb-page-heading"><div><p className="smb-eyebrow">FLEET MANAGEMENT</p><h1>{currentTitle.title}</h1><p className="smb-page-description">{currentTitle.description}</p></div><div className="smb-heading-meta"><span className="smb-local-badge"><Server size={14} /> Server lokal</span><small>{refreshAt ? `Diperbarui ${formatTime(refreshAt)}` : loading ? "Menghubungkan..." : "Belum tersinkron"}</small></div></div>
@@ -333,11 +399,12 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
 
           {page === "overview" && <OverviewPage devices={devices} onlineCount={onlineCount} brokerConnected={broker.connected} beaconActive={beaconActive} beaconBusy={beaconBusy} beaconMessage={beaconMessage} onStartBeacon={() => void startMasterBeacon()} onStopBeacon={() => void stopMasterBeacon()} telemetry={trackerTelemetry} locationHistory={snapshot?.locationHistory || []} signalHistory={snapshot?.signalHistory || []} commands={commands} telegramConfigured={snapshot?.telegram.configured || false} supabaseConfigured={snapshot?.supabase.configured || false} onOpenDevices={() => go("devices")} onOpenCommands={() => go("commands")} onSelectDevice={openDevice} />}
           {page === "devices" && <DevicesPage devices={filteredDevices} search={search} setSearch={setSearch} selected={selected} telemetry={telemetry} onlineCount={onlineCount} onSelect={setSelectedId} onCommand={setConfirm} onRename={() => setRenaming(true)} />}
+          {page === "sites" && adminUser.role === "superadmin" && <SitesPage apiBase={apiBase} token={token} sites={snapshot?.sites || []} devices={devices} onChanged={refreshSnapshot} />}
           {page === "commands" && <CommandsPage commands={commands} devices={devices} onOpenDevice={(id) => { setSelectedId(id); setPage("devices"); }} />}
           {page === "proximity" && <ProximityPage telemetry={trackerTelemetry} devices={devices} />}
           {page === "policy" && <PolicyPage telemetry={trackerTelemetry} />}
           {page === "integrations" && <IntegrationsPage brokerConnected={broker.connected} telegramConfigured={snapshot?.telegram.configured || false} supabaseConfigured={snapshot?.supabase.configured || false} />}
-          {page === "server" && <ServerDownloadsPage apiBase={apiBase} token={token} brokerConnected={broker.connected} />}
+          {page === "server" && <ServerDownloadsPage apiBase={apiBase} token={token} brokerConnected={broker.connected} sites={snapshot?.sites || []} isSuperadmin={adminUser.role === "superadmin"} />}
           {page === "settings" && <><SettingsPage devices={devices} telemetry={trackerTelemetry} brokerConnected={broker.connected} telegramConfigured={snapshot?.telegram.configured || false} /><ChangePasswordPanel apiBase={apiBase} token={token} /></>}
           {page === "admins" && adminUser.role === "superadmin" && <AdminUsersPage apiBase={apiBase} token={token} />}
           {page === "telegram" && adminUser.role === "superadmin" && <TelegramAccessPage apiBase={apiBase} token={token} />}
@@ -345,7 +412,7 @@ function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser
         </div>
       </main>
 
-      {confirm && selected && <div className="smb-modal-backdrop" role="presentation" onClick={() => setConfirm(null)}><section className="smb-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="smb-confirm-title" onClick={(event) => event.stopPropagation()}><div className={`smb-modal-icon ${confirm === "lock" ? "modal-lock" : "modal-unlock"}`}>{confirm === "lock" ? <LockKeyhole size={23} /> : <UnlockKeyhole size={23} />}</div><button className="smb-modal-close" onClick={() => setConfirm(null)} aria-label="Tutup"><X size={18} /></button><p className="smb-eyebrow">KONFIRMASI TARGET</p><h2 id="smb-confirm-title">{confirm === "lock" ? "Kunci mode kios?" : "Buka mode kios?"}</h2><p>Perintah akan ditujukan tepat ke perangkat berikut. Periksa nama dan ID sebelum melanjutkan.</p><div className="smb-confirm-target"><Smartphone size={18} /><div><strong>{selected.name}</strong><code>{selected.deviceId}</code></div><span className="smb-live-dot" /></div><div className="smb-modal-actions"><button className="smb-button-muted" onClick={() => setConfirm(null)}>Batal</button><button className={confirm === "lock" ? "smb-button-danger" : "smb-button-primary"} onClick={() => sendCommand(confirm)}>{confirm === "lock" ? "Kirim perintah kunci" : "Kirim perintah buka"}</button></div><small>Android dapat menolak permintaan jika aplikasi tracker tidak berada di depan.</small></section></div>}
+      {confirm && selected && <div className="smb-modal-backdrop" role="presentation" onClick={() => setConfirm(null)}><section className="smb-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="smb-confirm-title" onClick={(event) => event.stopPropagation()}><div className={`smb-modal-icon ${confirm === "uninstall" ? "modal-uninstall" : confirm === "lock" ? "modal-lock" : "modal-unlock"}`}>{confirm === "uninstall" ? <Trash2 size={23} /> : confirm === "lock" ? <LockKeyhole size={23} /> : <UnlockKeyhole size={23} />}</div><button className="smb-modal-close" onClick={() => setConfirm(null)} aria-label="Tutup"><X size={18} /></button><p className="smb-eyebrow">KONFIRMASI TARGET</p><h2 id="smb-confirm-title">{confirm === "lock" ? "Kunci mode kios?" : confirm === "unlock" ? "Buka mode kios?" : "Buka layar hapus aplikasi?"}</h2><p>{confirm === "uninstall" ? "Satu konfirmasi saja di sini. HP tracker akan membuka layar hapus bawaan Android; penghapusan tetap butuh 1 konfirmasi lagi di HP." : "Perintah akan ditujukan tepat ke perangkat berikut. Periksa nama dan ID sebelum melanjutkan."}</p><div className="smb-confirm-target"><Smartphone size={18} /><div><strong>{selected.name}</strong><code>{selected.deviceId}</code></div><span className="smb-live-dot" /></div><div className="smb-modal-actions"><button className="smb-button-muted" onClick={() => setConfirm(null)}>Batal</button><button className={confirm === "uninstall" ? "smb-button-danger" : confirm === "lock" ? "smb-button-danger" : "smb-button-primary"} onClick={() => sendCommand(confirm)}>{confirm === "uninstall" ? "Buka layar hapus" : confirm === "lock" ? "Kirim perintah kunci" : "Kirim perintah buka"}</button></div><small>{confirm === "uninstall" ? "Blokir hapus dipasang kembali otomatis 30 detik setelah layar terbuka." : "Android dapat menolak permintaan jika aplikasi tracker tidak berada di depan."}</small></section></div>}
 
       {renaming && selected && <div className="smb-modal-backdrop" role="presentation" onClick={() => setRenaming(false)}><section className="smb-confirm-modal smb-rename-modal" role="dialog" aria-modal="true" aria-labelledby="smb-rename-title" onClick={(event) => event.stopPropagation()}><button className="smb-modal-close" onClick={() => setRenaming(false)} aria-label="Tutup"><X size={18} /></button><p className="smb-eyebrow">UBAH IDENTITAS</p><h2 id="smb-rename-title">Ganti nama perangkat</h2><p>Nama baru akan disimpan broker untuk target ID ini.</p><div className="smb-confirm-target"><Smartphone size={18} /><div><strong>{selected.name}</strong><code>{selected.deviceId}</code></div></div><input className="smb-rename-input" value={renameValue} onChange={(event) => setRenameValue(event.target.value)} maxLength={40} placeholder="Contoh: HP-001-TOKO-A" /><div className="smb-modal-actions"><button className="smb-button-muted" onClick={() => setRenaming(false)}>Batal</button><button className="smb-button-primary" disabled={!renameValue.trim()} onClick={rename}>Simpan nama</button></div></section></div>}
     </div>
@@ -378,7 +445,7 @@ function OverviewPage({ devices, onlineCount, brokerConnected, beaconActive, bea
     </div>
     <section className="smb-panel smb-master-beacon-panel"><div className="smb-master-beacon-icon"><Radio size={21} /></div><div className="smb-master-beacon-copy"><span className="smb-panel-kicker">BEACON SMB MASTER</span><strong>{beaconActive ? "Beacon BLE aktif" : "Beacon BLE belum aktif"}</strong><small>{beaconMessage}</small></div><span className={`smb-status-pill ${beaconActive ? "status-on" : "status-off"}`}>{beaconActive ? "AKTIF" : "MATI"}</span><button className={beaconActive ? "smb-button-muted" : "smb-button-primary"} onClick={beaconActive ? onStopBeacon : onStartBeacon} disabled={beaconBusy}>{beaconBusy ? "Memproses…" : beaconActive ? "Hentikan beacon" : "Aktifkan beacon"}</button></section>
     <div className="smb-overview-grid smb-live-overview-grid">
-      <section className="smb-panel smb-live-radar-panel"><PanelHeading kicker="RADAR KEDEKATAN · BLE" title="Pemantauan perangkat" action={<button className="smb-text-link" onClick={onOpenDevices}>Detail tracker <ArrowUpRight size={14} /></button>} /><div className="smb-device-id-line"><span className={`smb-live-dot ${online ? "" : "is-off"}`} />{TRACKER_ID}<span className={`smb-status-pill ${online ? "status-on" : "status-off"}`}>{online ? "ONLINE" : "OFFLINE"}</span></div><div className={`smb-radar-stage ${detected ? "is-detected" : ""}`} role="img" aria-label={`Radar BLE. Tracker ${detected ? "terdeteksi" : "belum terdeteksi"}; radar tidak menunjukkan koordinat atau arah.`}><div className="smb-radar-sweep" /><div className="smb-radar-ring ring-one" /><div className="smb-radar-ring ring-two" /><div className="smb-radar-ring ring-three" /><div className="smb-radar-crosshair crosshair-x" /><div className="smb-radar-crosshair crosshair-y" /><div className="smb-radar-center"><Radio size={22} /></div></div><div className="smb-radar-summary"><span className={`smb-radar-state-dot ${detected ? "" : "is-off"}`} /><div><small>{detected ? "Beacon master diterima tracker" : "Menunggu beacon BLE"}</small><strong>{detected ? "Perangkat saling terdeteksi" : "Belum ada sinyal langsung"}</strong></div><span className="smb-radar-rssi">{detected && telemetry?.rssi != null ? `${telemetry.rssi} dBm` : "— dBm"}</span></div><div className="smb-mini-stats"><div><small>Device Owner</small><strong>{telemetry?.deviceOwner ? "Aktif" : "Belum dilaporkan"}</strong></div><div><small>Mode kios</small><strong>{telemetry?.lockTaskMode ? "Terkunci" : "Tidak terkunci"}</strong></div><div><small>Diperbarui</small><strong>{telemetry?.receivedAt ? formatTime(telemetry.receivedAt) : "Belum tersedia"}</strong></div></div></section>
+      <section className="smb-panel smb-live-radar-panel"><PanelHeading kicker="RADAR KEDEKATAN · BLE" title="Pemantauan perangkat" action={<button className="smb-text-link" onClick={onOpenDevices}>Detail tracker <ArrowUpRight size={14} /></button>} /><div className="smb-device-id-line"><span className={`smb-live-dot ${online ? "" : "is-off"}`} />{TRACKER_ID}<span className={`smb-status-pill ${online ? "status-on" : "status-off"}`}>{online ? "ONLINE" : "OFFLINE"}</span></div><div className={`smb-radar-stage ${detected ? "is-detected" : ""}`} role="img" aria-label={`Radar BLE. Tracker ${detected ? "terdeteksi" : "belum terdeteksi"}; radar tidak menunjukkan koordinat atau arah.`}><div className="smb-radar-sweep" /><div className="smb-radar-ring ring-one" /><div className="smb-radar-ring ring-two" /><div className="smb-radar-ring ring-three" /><div className="smb-radar-crosshair crosshair-x" /><div className="smb-radar-crosshair crosshair-y" /><div className="smb-radar-center"><Radio size={22} /></div></div><div className="smb-radar-summary"><span className={`smb-radar-state-dot ${detected ? "" : "is-off"}`} /><div><small>{detected ? "Beacon master diterima tracker" : "Menunggu beacon BLE"}</small><strong>{detected ? "Perangkat saling terdeteksi" : "Belum ada sinyal langsung"}</strong></div><span className="smb-radar-rssi">{detected && telemetry?.rssi != null ? `${telemetry.rssi} dBm` : "— dBm"}</span></div><div className="smb-mini-stats"><div><small>Device Owner</small><strong>{telemetry?.deviceOwner ? "Aktif" : "Belum dilaporkan"}</strong></div><div><small>Mode kios</small><strong>{lockModeLabel(telemetry?.lockTaskMode)}</strong></div><div><small>Diperbarui</small><strong>{telemetry?.receivedAt ? formatTime(telemetry.receivedAt) : "Belum tersedia"}</strong></div></div></section>
       <section className="smb-panel smb-location-panel"><PanelHeading kicker="LOKASI PERANGKAT" title="Peta armada" action={<span className={`smb-location-mode ${hasLocation ? "location-mode-live" : ""}`}><MapPin size={13} /> {hasLocation ? "Lokasi live" : "Lokasi menunggu"}</span>} /><div className={`smb-location-canvas ${showMap && hasLocation ? "has-live-map" : ""}`}>{showMap && hasLocation ? <iframe className="smb-location-iframe" title={`Peta OpenStreetMap untuk ${TRACKER_ID}`} src={mapEmbedUrl} loading="lazy" referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-popups" /> : <><div className="smb-map-grid" /><div className="smb-map-orbit orbit-a" /><div className="smb-map-orbit orbit-b" /></>}{hasLocation ? <div className={`smb-map-position ${showMap ? "is-over-map" : ""}`}><div className="smb-map-pin-icon"><MapPin size={22} /></div><span className="smb-map-live-tag"><i /> POSISI TERAKHIR</span><strong>{telemetry!.latitude!.toFixed(6)}, {telemetry!.longitude!.toFixed(6)}</strong><small>Akurasi ±{telemetry?.accuracyMeters == null ? "—" : `${Math.round(telemetry.accuracyMeters)} m`} · {formatTime(telemetry!.locationAt!)}</small><button className="smb-map-load-button" onClick={() => setShowMap((visible) => !visible)}>{showMap ? "Tutup peta" : "Muat peta nyata · OpenStreetMap"}</button><a href={mapUrl} target="_blank" rel="noreferrer">Buka peta penuh <ArrowUpRight size={13} /></a></div> : <div className="smb-map-empty"><div className="smb-map-pin-icon"><MapPin size={22} /></div><strong>Menunggu koordinat GPS</strong><p>Berikan izin lokasi di SMB Lacak dan tunggu perbaikan lokasi pertama. Titik hanya muncul dari koordinat aktual tracker.</p><span><MapPinOff size={14} /> Belum ada posisi yang dilaporkan</span></div>}<div className="smb-map-footer"><span>TRACKER · {TRACKER_ID}</span><strong>{hasLocation ? telemetry!.locationProvider?.toUpperCase() || "LOKASI" : "Menunggu laporan"}</strong></div></div>{hasLocation && <small className="smb-map-privacy">Peta jalan dimuat dari OpenStreetMap hanya setelah Anda menekan Muat peta; layanan peta menerima koordinat titik dan permintaan jaringan.</small>}{locationHistory.length > 1 && <div className="smb-location-history"><span>LOKASI SEBELUMNYA</span>{locationHistory.slice(-4).reverse().map((point) => <div key={`${point.deviceId}-${point.locationAt}`}><strong>{point.latitude.toFixed(5)}, {point.longitude.toFixed(5)}</strong><small>{formatTime(point.locationAt)} · ±{point.accuracyMeters == null ? "—" : `${Math.round(point.accuracyMeters)} m`}</small></div>)}</div>}</section>
     </div>
     <div className="smb-lower-grid"><section className="smb-panel"><PanelHeading kicker="ARMADA" title="Perangkat terdaftar" action={<button className="smb-text-link" onClick={onOpenDevices}>Buka daftar <ArrowUpRight size={14} /></button>} /><div className="smb-device-compact-list">{devices.map((device) => <button className="smb-device-compact" key={device.deviceId} onClick={() => onSelectDevice(device)}><div className="smb-device-type-icon"><Smartphone size={18} /></div><div className="smb-device-compact-copy"><strong>{device.name}</strong><small>{device.deviceId}</small></div><span className={`smb-status-pill ${device.online ? "status-on" : "status-off"}`}>{device.online ? "ONLINE" : "OFFLINE"}</span><ChevronRight size={16} /></button>)}</div></section><section className="smb-panel smb-activity-panel"><PanelHeading kicker="AKTIVITAS" title="Perintah terbaru" action={<button className="smb-text-link" onClick={onOpenCommands}>Semua <ArrowUpRight size={14} /></button>} />{commands.length ? <div className="smb-command-list">{commands.slice(0, 5).map((row) => <CommandListRow key={row.id} row={row} device={devices.find((device) => device.deviceId === row.deviceId)} />)}</div> : <EmptyState icon={<Command size={21} />} title="Belum ada perintah" body="Aktivitas perintah akan muncul setelah broker menerima instruksi dari master atau bot." />}</section><section className="smb-panel"><PanelHeading kicker="KONEKSI" title="Layanan broker" /><div className="smb-service-list"><ServiceRow icon={<Server size={17} />} label="Server PC lokal" value={brokerConnected ? "WSS aktif" : "Terputus"} ok={brokerConnected} /><ServiceRow icon={<Bot size={17} />} label="Telegram Bot" value={telegramConfigured ? "Token siap" : "Belum dikonfigurasi"} ok={telegramConfigured} /><ServiceRow icon={<Network size={17} />} label="Supabase" value={supabaseConfigured ? "Kredensial siap" : "Menunggu kredensial"} ok={supabaseConfigured} /><ServiceRow icon={<ShieldCheck size={17} />} label="Keamanan transport" value="TLS / WSS" ok={true} /></div></section></div>
@@ -414,10 +481,11 @@ function SignalHistoryPanel({ history }: { history: SignalSample[] }) {
 }
 
 function DevicesPage({ devices, search, setSearch, selected, telemetry, onlineCount, onSelect, onCommand, onRename }: {
-  devices: Device[]; search: string; setSearch: (value: string) => void; selected?: Device; telemetry: Device["telemetry"]; onlineCount: number; onSelect: (id: string) => void; onCommand: (command: "lock" | "unlock") => void; onRename: () => void;
+  devices: Device[]; search: string; setSearch: (value: string) => void; selected?: Device; telemetry: Device["telemetry"]; onlineCount: number; onSelect: (id: string) => void; onCommand: (command: "lock" | "unlock" | "uninstall") => void; onRename: () => void;
 }) {
-  return <div className="smb-device-page-grid"><section className="smb-panel smb-device-table-panel"><div className="smb-list-toolbar"><div><span className="smb-panel-kicker">REGISTRI PERANGKAT</span><strong>{devices.length} perangkat ditemukan · {onlineCount} online</strong></div><label className="smb-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Cari nama atau ID" /></label></div><div className="smb-device-table"><div className="smb-table-head"><span>PERANGKAT</span><span>STATUS</span><span>TELEMETRI</span><span /></div>{devices.map((device) => <button className={`smb-table-row ${selected?.deviceId === device.deviceId ? "is-selected" : ""}`} key={device.deviceId} onClick={() => onSelect(device.deviceId)}><div className="smb-table-device"><div className="smb-device-type-icon"><Smartphone size={18} /></div><div><strong>{device.name}</strong><small>{device.deviceId}</small></div></div><span className={`smb-status-pill ${device.online ? "status-on" : "status-off"}`}><i />{device.online ? "ONLINE" : "OFFLINE"}</span><span className="smb-table-telemetry">{device.deviceId === TRACKER_ID && telemetry?.detected ? `BLE ${telemetry.rssi ?? "—"} dBm` : device.lastSeenAt ? `Terlihat ${formatTime(device.lastSeenAt)}` : "Belum ada data"}</span><ChevronRight size={16} /></button>)}{devices.length === 0 && <EmptyState icon={<Search size={20} />} title="Tidak ada hasil" body="Coba cari dengan nama atau ID perangkat yang tepat." />}</div><div className="smb-table-footer"><span>Menampilkan data registri nyata</span><span><span className="smb-live-dot" /> Sinkron dengan broker</span></div></section>
-    {selected ? <section className="smb-panel smb-device-detail"><div className="smb-detail-top"><div className="smb-device-type-icon detail-device-icon"><Smartphone size={21} /></div><span className={`smb-status-pill ${selected.online ? "status-on" : "status-off"}`}>{selected.online ? "ONLINE" : "OFFLINE"}</span></div><span className="smb-panel-kicker">DETAIL PERANGKAT</span><h2>{selected.name}</h2><code className="smb-detail-id">{selected.deviceId}</code><div className="smb-detail-divider" /><div className="smb-detail-info"><DetailValue label="Peran" value={selected.role === "master" ? "Master" : "Tracker sewa"} /><DetailValue label="Koneksi" value={selected.online ? "Online saat ini" : "Offline"} /><DetailValue label="Terakhir terlihat" value={selected.lastSeenAt ? formatTime(selected.lastSeenAt) : "Belum tersedia"} /><DetailValue label="BLE" value={selected.deviceId === TRACKER_ID && telemetry?.detected ? `${telemetry.rssi ?? "—"} dBm` : "Tidak terdeteksi"} /><DetailValue label="Baterai" value={selected.deviceId === TRACKER_ID && telemetry?.batteryLevel != null ? `${telemetry.batteryLevel}%` : "Belum dilaporkan"} /><DetailValue label="Lokasi" value={telemetry?.locationAt && telemetry.latitude != null && telemetry.longitude != null ? `${telemetry.latitude}, ${telemetry.longitude}` : "Belum ada koordinat aktual"} /></div>{telemetry?.locationAt && telemetry.latitude != null && telemetry.longitude != null && <a className="smb-device-map-link" href={`https://maps.google.com/?q=${telemetry.latitude},${telemetry.longitude}`} target="_blank" rel="noreferrer"><MapPin size={14} /> Buka peta lokasi - akurasi +/-{telemetry.accuracyMeters == null ? "tidak tersedia" : `${Math.round(telemetry.accuracyMeters)} m`}</a>}<div className="smb-detail-actions"><button className="smb-button-muted" onClick={onRename} disabled={selected.deviceId !== TRACKER_ID}><Pencil size={15} /> Ubah nama</button><button className="smb-button-danger" onClick={() => onCommand("lock")} disabled={selected.deviceId !== TRACKER_ID || !telemetry?.deviceOwner}><LockKeyhole size={15} /> Lock kios</button><button className="smb-button-outline" onClick={() => onCommand("unlock")} disabled={selected.deviceId !== TRACKER_ID || !selected.online}><UnlockKeyhole size={15} /> Buka kios</button><button className="smb-button-outline" disabled title="Kamera jarak jauh tidak diaktifkan; Android mensyaratkan penggunaan yang terlihat dan persetujuan di perangkat."><EyeOff size={15} /> Kamera tidak tersedia</button></div>{selected.deviceId !== TRACKER_ID && <div className="smb-info-note"><AlertTriangle size={16} /><span>Command pilot saat ini hanya diaktifkan untuk tracker {TRACKER_ID}.</span></div>}<div className="smb-info-note"><ShieldCheck size={16} /><span>Pelacakan memakai izin Android dan notifikasi layanan yang terlihat. Menyembunyikan aplikasi atau notifikasi tidak didukung.</span></div></section> : <section className="smb-panel smb-device-detail"><EmptyState icon={<Smartphone size={21} />} title="Pilih perangkat" body="Pilih satu baris untuk melihat telemetri dan aksi yang tersedia." /></section>}</div>;
+  const isTracker = selected?.role === "tracker";
+  return <div className="smb-device-page-grid"><section className="smb-panel smb-device-table-panel"><div className="smb-list-toolbar"><div><span className="smb-panel-kicker">REGISTRI PERANGKAT</span><strong>{devices.length} perangkat ditemukan · {onlineCount} online</strong></div><label className="smb-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Cari nama, site, atau ID" /></label></div><div className="smb-device-table"><div className="smb-table-head"><span>PERANGKAT</span><span>STATUS</span><span>TELEMETRI</span><span /></div>{devices.map((device) => <button className={`smb-table-row ${selected?.deviceId === device.deviceId ? "is-selected" : ""}`} key={device.deviceId} onClick={() => onSelect(device.deviceId)}><div className="smb-table-device"><div className="smb-device-type-icon"><Smartphone size={18} /></div><div><strong>{device.name}</strong><small>{device.deviceId}{device.siteName ? ` · ${device.siteName}` : ""}</small></div></div><span className={`smb-status-pill ${device.online ? "status-on" : "status-off"}`}><i />{device.online ? "ONLINE" : "OFFLINE"}</span><span className="smb-table-telemetry">{device.wifiSsid ? `WiFi ${device.wifiSsid}` : device.lastSeenAt ? `Terlihat ${formatTime(device.lastSeenAt)}` : "Belum ada data"}</span><ChevronRight size={16} /></button>)}{devices.length === 0 && <EmptyState icon={<Search size={20} />} title="Tidak ada hasil" body="Coba cari dengan nama, site, atau ID perangkat yang tepat." />}</div><div className="smb-table-footer"><span>Menampilkan data registri nyata</span><span><span className="smb-live-dot" /> Sinkron realtime via WebSocket</span></div></section>
+    {selected ? <section className="smb-panel smb-device-detail"><div className="smb-detail-top"><div className="smb-device-type-icon detail-device-icon"><Smartphone size={21} /></div><span className={`smb-status-pill ${selected.online ? 'status-on' : 'status-off'}`}>{selected.online ? "ONLINE" : "OFFLINE"}</span></div><span className="smb-panel-kicker">DETAIL PERANGKAT</span><h2>{selected.name}</h2><code className="smb-detail-id">{selected.deviceId}</code><div className="smb-detail-divider" /><div className="smb-detail-info"><DetailValue label="Peran" value={selected.role === "master" ? "Master" : "Tracker"} /><DetailValue label="Site/tim" value={selected.siteName || "Belum ada site"} /><DetailValue label="Koneksi" value={selected.online ? "Online saat ini" : "Offline"} /><DetailValue label="Terakhir terlihat" value={selected.lastSeenAt ? formatTime(selected.lastSeenAt) : "Belum tersedia"} /><DetailValue label="WiFi saat ini" value={telemetry?.wifiSsid || selected.wifiSsid || "Belum dilaporkan"} /><DetailValue label="BLE" value={telemetry?.detected ? `${telemetry.rssi ?? '—'} dBm` : "Tidak terdeteksi"} /><DetailValue label="Baterai" value={telemetry?.batteryLevel != null ? `${telemetry.batteryLevel}%` : "Belum dilaporkan"} /><DetailValue label="Mode kios" value={lockModeLabel(telemetry?.lockTaskMode)} /><DetailValue label="Blokir hapus" value={selected.role === "master" ? "—" : selected.uninstallBlocked !== false ? "Aktif" : "Nonaktif"} /><DetailValue label="Lokasi" value={telemetry?.locationAt && telemetry.latitude != null && telemetry.longitude != null ? `${telemetry.latitude}, ${telemetry.longitude}` : "Belum ada koordinat aktual"} /></div>{telemetry?.locationAt && telemetry.latitude != null && telemetry.longitude != null && <a className="smb-device-map-link" href={`https://maps.google.com/?q=${telemetry.latitude},${telemetry.longitude}`} target="_blank" rel="noreferrer"><MapPin size={14} /> Buka peta lokasi - akurasi +/-{telemetry.accuracyMeters == null ? "tidak tersedia" : `${Math.round(telemetry.accuracyMeters)} m`}</a>}<div className="smb-detail-actions"><button className="smb-button-muted" onClick={onRename} disabled={!isTracker}><Pencil size={15} /> Ubah nama</button><button className="smb-button-danger" onClick={() => onCommand("lock")} disabled={!isTracker || !telemetry?.deviceOwner} title={telemetry?.deviceOwner ? "Kunci mode kios melalui Device Owner" : "Memerlukan enrollment Android Device Owner"}><LockKeyhole size={15} /> Lock kios</button><button className="smb-button-outline" onClick={() => onCommand("unlock")} disabled={!isTracker || !selected.online}><UnlockKeyhole size={15} /> Buka kios</button><button className="smb-button-outline smb-button-uninstall" onClick={() => onCommand("uninstall")} disabled={!isTracker || !selected.online} title="Buka layar hapus bawaan Android (1 konfirmasi di HP)"><Trash2 size={15} /> Hapus aplikasi</button></div>{isTracker && !telemetry?.deviceOwner && <div className="smb-info-note"><AlertTriangle size={16} /><span>Mode kios jarak jauh belum tersedia karena Android belum mendaftarkan aplikasi ini sebagai Device Owner.</span></div>}{isTracker && selected.uninstallBlocked !== false && <div className="smb-info-note"><ShieldCheck size={16} /><span>Penghapusan APK diblokir di HP. Tombol "Hapus aplikasi" membuka layar hapus resmi Android; blokir dipasang kembali otomatis.</span></div>}{selected.role === "master" && <div className="smb-info-note"><AlertTriangle size={16} /><span>Perintah lock/unlock/hapus hanya ditujukan ke HP tracker, bukan ke master.</span></div>}<div className="smb-info-note"><ShieldCheck size={16} /><span>Pelacakan memakai izin Android dan notifikasi layanan yang terlihat. Menyembunyikan aplikasi atau notifikasi tidak didukung.</span></div></section> : <section className="smb-panel smb-device-detail"><EmptyState icon={<Smartphone size={21} />} title="Pilih perangkat" body="Pilih satu baris untuk melihat telemetri, site/tim, dan aksi yang tersedia." /></section>}</div>;
 }
 
 function CommandsPage({ commands, devices, onOpenDevice }: { commands: CommandRow[]; devices: Device[]; onOpenDevice: (id: string) => void }) {
@@ -434,19 +502,22 @@ function ProximityPage({ telemetry, devices }: { telemetry: Snapshot["telemetry"
 
 function PolicyPage({ telemetry }: { telemetry: Snapshot["telemetry"] | null | undefined }) {
   const owner = Boolean(telemetry?.deviceOwner);
-  const locked = Boolean(telemetry?.lockTaskMode);
-  return <div className="smb-two-column-page"><section className="smb-panel smb-policy-card"><div className={`smb-policy-icon ${owner ? "is-ready" : ""}`}><ShieldCheck size={25} /></div><span className="smb-panel-kicker">DEVICE POLICY CONTROLLER</span><h2>{owner ? "Device Owner aktif" : "Belum dikonfirmasi"}</h2><p>Status yang terakhir diterima dari aplikasi tracker Android.</p><div className="smb-policy-status-list"><ServiceRow icon={<ShieldCheck size={17} />} label="Android Device Owner" value={owner ? "Aktif" : "Tidak terlapor"} ok={owner} /><ServiceRow icon={<LockKeyhole size={17} />} label="Lock Task" value={locked ? "Aktif" : "Tidak aktif"} ok={locked} /><ServiceRow icon={<Smartphone size={17} />} label="Aktivitas tracker di depan" value="Tidak dilaporkan" ok={false} /></div></section><section className="smb-panel"><PanelHeading kicker="BATAS ANDROID" title="Perilaku kontrol perangkat" /><div className="smb-capability-list"><CapabilityRow good icon={<Check size={16} />} title="Pembatasan kiosk tersedia" text="Device Owner dapat mengizinkan aplikasi tracker masuk Lock Task." /><CapabilityRow icon={<AlertTriangle size={16} />} title="Perintah jarak jauh bisa ditolak" text="Android mensyaratkan kondisi aktivitas yang sesuai; broker hanya mencatat ACK atau error aktual." /><CapabilityRow icon={<EyeOff size={16} />} title="Kamera rahasia tidak tersedia" text="Pengambilan kamera diam-diam tidak disediakan. Android menampilkan izin dan indikator privasi." /></div><div className="smb-policy-warning"><AlertTriangle size={17} /><span>Lock Task membatasi perangkat hanya ketika kebijakan Android dan status activity mengizinkan. Ini bukan jaminan perangkat sama sekali tidak bisa dipakai di semua kondisi.</span></div></section></div>;
+  const locked = telemetry?.lockTaskMode === 1;
+  return <div className="smb-two-column-page"><section className="smb-panel smb-policy-card"><div className={`smb-policy-icon ${owner ? "is-ready" : ""}`}><ShieldCheck size={25} /></div><span className="smb-panel-kicker">DEVICE POLICY CONTROLLER</span><h2>{owner ? "Device Owner aktif" : "Belum terdaftar sebagai Device Owner"}</h2><p>Status langsung terakhir dari Android, diperbarui lewat WebSocket.</p><div className="smb-policy-status-list"><ServiceRow icon={<ShieldCheck size={17} />} label="Android Device Owner" value={owner ? "Aktif" : "Tidak terlapor"} ok={owner} /><ServiceRow icon={<LockKeyhole size={17} />} label="Mode kunci Android" value={lockModeLabel(telemetry?.lockTaskMode)} ok={locked} /><ServiceRow icon={<Smartphone size={17} />} label="Aktivitas tracker di depan" value="Tidak dilaporkan" ok={false} /></div></section><section className="smb-panel"><PanelHeading kicker="BATAS ANDROID" title="Perilaku kontrol perangkat" /><div className="smb-capability-list"><CapabilityRow good icon={<Check size={16} />} title="Pembatasan kiosk tersedia" text="Device Owner dapat mengizinkan aplikasi tracker masuk Lock Task." /><CapabilityRow icon={<AlertTriangle size={16} />} title="Perintah jarak jauh bisa ditolak" text="Android mensyaratkan kondisi aktivitas yang sesuai; broker menandai sukses hanya setelah Android mengonfirmasi mode kios aktif." /><CapabilityRow icon={<EyeOff size={16} />} title="Kamera rahasia tidak tersedia" text="Pengambilan kamera diam-diam tidak disediakan. Android menampilkan izin dan indikator privasi." /></div><div className="smb-policy-warning"><AlertTriangle size={17} /><span>Lock Task memerlukan enrollment Device Owner yang sah. Aplikasi biasa tidak dapat menonaktifkan Home atau mengunci seluruh perangkat sebagai kios.</span></div></section></div>;
 }
 
 type OperationLogEntry = { source: string; timestamp: string; message: string };
 type ServerOperations = { generatedAt: string; broker: { status: string; host: string; port: number }; logs: OperationLogEntry[] };
 
-function ServerDownloadsPage({ apiBase, token, brokerConnected }: { apiBase: string; token: string; brokerConnected: boolean }) {
+function ServerDownloadsPage({ apiBase, token, brokerConnected, sites, isSuperadmin }: { apiBase: string; token: string; brokerConnected: boolean; sites: Site[]; isSuperadmin: boolean }) {
   const [logs, setLogs] = useState<OperationLogEntry[]>([]);
   const [logsState, setLogsState] = useState("Mengambil log broker…");
   const [logUpdatedAt, setLogUpdatedAt] = useState("");
   const [downloading, setDownloading] = useState("");
   const [downloadError, setDownloadError] = useState("");
+  const [sitePicker, setSitePicker] = useState<{ step: "pick" | "code"; siteId: number | ""; code?: string; expiresAt?: string } | null>(null);
+  const [pickerBusy, setPickerBusy] = useState(false);
+  const [pickerError, setPickerError] = useState("");
   const refreshLogs = useCallback(async () => {
     try {
       const response = await fetch(`${apiBase}/api/admin/operations`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
@@ -487,8 +558,35 @@ function ServerDownloadsPage({ apiBase, token, brokerConnected }: { apiBase: str
     } finally { setDownloading(""); }
   };
 
+  // Unduh APK Lacak selalu diawali pemilihan site/tim agar kode enrolmen ikut terbawa.
+  const openSitePicker = () => {
+    setPickerError("");
+    setDownloadError("");
+    setSitePicker({ step: "pick", siteId: sites[0]?.id ?? "" });
+  };
+  const confirmSiteDownload = async () => {
+    if (!sitePicker || pickerBusy) return;
+    const siteId = Number(sitePicker.siteId);
+    if (!siteId || !isSuperadmin) {
+      setSitePicker(null);
+      await downloadFile("tracker", "SMB-Lacak.apk");
+      return;
+    }
+    setPickerBusy(true);
+    setPickerError("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/sites/${siteId}/enrollment-code`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      const data = await response.json() as { code?: string; expiresAt?: string; message?: string };
+      if (!response.ok || !data.code) throw new Error(data.message || "Kode enrolmen gagal dibuat.");
+      setSitePicker({ step: "code", siteId, code: data.code, expiresAt: data.expiresAt });
+      void downloadFile("tracker", "SMB-Lacak.apk");
+    } catch (error) {
+      setPickerError(error instanceof Error ? error.message : "Kode enrolmen gagal dibuat.");
+    } finally { setPickerBusy(false); }
+  };
+
   const files = [
-    { id: "tracker" as const, title: "SMB Lacak", kind: "APK ANDROID · TRACKER", filename: "SMB-Lacak.apk", detail: "Aplikasi tracker untuk perangkat armada. Build APK debug terbaru yang tersedia di PC broker.", icon: <MapPin size={20} />, button: "Unduh APK Lacak" },
+    { id: "tracker" as const, title: "SMB Lacak", kind: "APK ANDROID · TRACKER", filename: "SMB-Lacak.apk", detail: "Aplikasi tracker untuk perangkat armada. Pilih site/tim lebih dulu agar kode enrolmen 24 jam ikut dibuat sebelum APK dipasang.", icon: <MapPin size={20} />, button: "Unduh APK Lacak" },
     { id: "master" as const, title: "SMB Master", kind: "APK ANDROID · MASTER", filename: "SMB-Master.apk", detail: "Aplikasi master untuk dashboard kontrol di perangkat Android.", icon: <Smartphone size={20} />, button: "Unduh APK Master" },
     { id: "server" as const, title: "SMB Server Console", kind: "WINDOWS · GUI", filename: "SMB-Fleet-Server.exe", detail: "Jendela kontrol broker PC dengan status server dan log langsung. Jalankan dari folder proyek yang berisi server dan .env.local.", icon: <Server size={20} />, button: "Unduh Server Console" },
   ];
@@ -500,13 +598,42 @@ function ServerDownloadsPage({ apiBase, token, brokerConnected }: { apiBase: str
     </div>
 
     <section className="smb-panel smb-download-section"><div className="smb-server-section-heading"><div><span className="smb-panel-kicker">PAKET PERANGKAT</span><h2>Unduh aplikasi dan server</h2><p>File diambil dari PC broker sesudah dashboard memverifikasi sesi admin.</p></div><span className="smb-download-lock"><ShieldCheck size={14} /> ADMIN SAJA</span></div>
-      <div className="smb-download-grid">{files.map((file) => <article className="smb-download-card" key={file.id}><div className="smb-download-card-top"><span className="smb-download-icon">{file.icon}</span><span className="smb-download-kind">{file.kind}</span></div><h3>{file.title}</h3><p>{file.detail}</p><div className="smb-download-file"><FileText size={14} /><span>{file.filename}</span><Download size={14} /></div><button className="smb-button-primary smb-download-button" disabled={downloading !== ""} onClick={() => void downloadFile(file.id, file.filename)}><Download size={15} />{downloading === file.id ? "Menyiapkan unduhan…" : file.button}</button></article>)}</div>
+      <div className="smb-download-grid">{files.map((file) => <article className="smb-download-card" key={file.id}><div className="smb-download-card-top"><span className="smb-download-icon">{file.icon}</span><span className="smb-download-kind">{file.kind}</span></div><h3>{file.title}</h3><p>{file.detail}</p><div className="smb-download-file"><FileText size={14} /><span>{file.filename}</span><Download size={14} /></div><button className="smb-button-primary smb-download-button" disabled={downloading !== ""} onClick={() => { if (file.id === "tracker") openSitePicker(); else void downloadFile(file.id, file.filename); }}><Download size={15} />{downloading === file.id ? "Menyiapkan unduhan…" : file.button}</button></article>)}</div>
       {downloadError && <div className="smb-admin-feedback is-error">{downloadError}</div>}
     </section>
 
     <section className="smb-panel smb-server-log-panel"><div className="smb-server-section-heading"><div><span className="smb-panel-kicker">AKTIVITAS SERVER</span><h2>Log broker dan Tunnel</h2><p>Log dibaca dari file lokal launcher Windows; tidak berisi isi .env atau token.</p></div><button className="smb-button-muted smb-log-refresh" onClick={() => void refreshLogs()}><RefreshCw size={14} /> Muat ulang</button></div>
       <div className="smb-server-log-list" aria-live="polite">{logs.length ? logs.map((entry, index) => <div className="smb-server-log-row" key={`${entry.source}-${entry.timestamp}-${index}`}><time>{entry.timestamp || "—"}</time><span className={`smb-log-source source-${entry.source}`}>{entry.source}</span><code>{entry.message}</code></div>) : <div className="smb-server-log-empty"><FileText size={21} /><strong>{logsState}</strong><span>Jalankan SMB Server Console di PC agar keluaran broker muncul sebagai log langsung.</span></div>}</div>
     </section>
+
+    {sitePicker && <div className="smb-modal-backdrop" role="presentation" onClick={() => { if (!pickerBusy) setSitePicker(null); }}>
+      <section className="smb-confirm-modal smb-site-picker" role="dialog" aria-modal="true" aria-labelledby="smb-site-picker-title" onClick={(event) => event.stopPropagation()}>
+        <div className="smb-modal-icon modal-unlock"><Building2 size={23} /></div>
+        <button className="smb-modal-close" onClick={() => setSitePicker(null)} aria-label="Tutup" disabled={pickerBusy}><X size={18} /></button>
+        {sitePicker.step === "pick" ? <>
+          <p className="smb-eyebrow">PILIH SITE/TIM</p>
+          <h2 id="smb-site-picker-title">Site/tim untuk APK Lacak</h2>
+          <p>Kode enrolmen mengikat HP tracker ke site/tim tertentu: WiFi yang diizinkan, nama site di laporan, dan peringatan Telegram mengikuti pilihan ini.</p>
+          {sites.length ? <label className="smb-picker-field">Site/tim<select className="smb-site-select" value={sitePicker.siteId} onChange={(event) => setSitePicker({ ...sitePicker, siteId: Number(event.target.value) })}>{sites.map((site) => <option key={site.id} value={site.id}>{site.name} · {site.wifiAllowlist.length ? site.wifiAllowlist.join(", ") : "semua WiFi"}</option>)}</select></label> : <p className="smb-picker-empty">Belum ada site/tim. Buat dulu lewat menu Site &amp; tim, atau lanjutkan unduhan tanpa kode enrolmen.</p>}
+          {pickerError && <div className="smb-admin-feedback is-error">{pickerError}</div>}
+          <div className="smb-modal-actions">
+            <button className="smb-button-muted" onClick={() => setSitePicker(null)} disabled={pickerBusy}>Batal</button>
+            <button className="smb-button-primary" onClick={() => void confirmSiteDownload()} disabled={pickerBusy || !sitePicker.siteId}>{pickerBusy ? "Membuat kode…" : isSuperadmin && sitePicker.siteId ? "Buat kode dan unduh APK" : "Unduh APK Lacak"}</button>
+          </div>
+          <small>{isSuperadmin ? "Kode enrolmen berlaku 24 jam, hanya bisa dipakai sekali, dan tampil satu kali saja di layar berikutnya." : "Kode enrolmen hanya dibuat oleh superadmin. Unduhan tetap berjalan tanpa kode."}</small>
+        </> : <>
+          <p className="smb-eyebrow">KODE ENROLMEN</p>
+          <h2 id="smb-site-picker-title">Kode untuk {sites.find((site) => site.id === sitePicker.siteId)?.name || "site terpilih"}</h2>
+          <code className="smb-enroll-code">{sitePicker.code}</code>
+          <div className="smb-enroll-meta"><span>Berlaku sampai {sitePicker.expiresAt ? formatTime(sitePicker.expiresAt) : "24 jam"}</span><span>Sekali pakai</span></div>
+          <div className="smb-modal-actions">
+            <button className="smb-button-muted" onClick={() => { void navigator.clipboard?.writeText(sitePicker.code || "").catch(() => undefined); }}><Copy size={14} /> Salin kode</button>
+            <button className="smb-button-primary" onClick={() => setSitePicker(null)}>Selesai</button>
+          </div>
+          <small>{downloading === "tracker" ? "Menyiapkan unduhan APK Lacak…" : downloadError || "Masukkan kode ini di layar enrolmen APK Lacak setelah dipasang di HP tracker."}</small>
+        </>}
+      </section>
+    </div>}
   </div>;
 }
 
@@ -704,6 +831,155 @@ function AdminUsersPage({ apiBase, token }: { apiBase: string; token: string }) 
         {users.length === 0 && <EmptyState icon={<Users size={21} />} title="Belum ada akun" body="Daftar pengguna akan muncul setelah dimuat dari broker." />}
       </div>
     </section>
+  </div>;
+}
+
+function SitesPage({ apiBase, token, sites, devices, onChanged }: { apiBase: string; token: string; sites: Site[]; devices: Device[]; onChanged: () => void }) {
+  const [name, setName] = useState("");
+  const [wifi, setWifi] = useState("");
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState<Site | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editWifi, setEditWifi] = useState("");
+  const [deleting, setDeleting] = useState<Site | null>(null);
+  const [issued, setIssued] = useState<{ code: string; expiresAt: string; siteName: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+  const headers = { Authorization: `Bearer ${token}`, "content-type": "application/json" };
+  const splitWifi = (value: string) => value.split(/[\n,;]+/).map((item) => item.trim()).filter(Boolean);
+  const reload = async (message: string) => { setNotice(message); setError(""); await onChanged(); };
+
+  const createSite = async (event: FormEvent) => {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true); setNotice(""); setError("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/sites`, { method: "POST", headers, body: JSON.stringify({ name: name.trim(), wifiAllowlist: splitWifi(wifi) }) });
+      const data = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(data.message || "Site/tim tidak dapat dibuat.");
+      setName(""); setWifi("");
+      await reload(data.message || "Site/tim dibuat.");
+    } catch (submitError) { setError(submitError instanceof Error ? submitError.message : "Site/tim tidak dapat dibuat."); }
+    finally { setBusy(false); }
+  };
+
+  const saveEdit = async () => {
+    if (!editing || busy) return;
+    setBusy(true); setNotice(""); setError("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/sites/${editing.id}`, { method: "PUT", headers, body: JSON.stringify({ name: editName.trim(), wifiAllowlist: splitWifi(editWifi) }) });
+      const data = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(data.message || "Perubahan site/tim gagal disimpan.");
+      setEditing(null);
+      await reload(data.message || "Site/tim diperbarui.");
+    } catch (saveError) { setError(saveError instanceof Error ? saveError.message : "Perubahan site/tim gagal disimpan."); }
+    finally { setBusy(false); }
+  };
+
+  const removeSite = async () => {
+    if (!deleting || busy) return;
+    setBusy(true); setNotice(""); setError("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/sites/${deleting.id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      const data = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(data.message || "Site/tim tidak dapat dihapus.");
+      setDeleting(null);
+      await reload(data.message || "Site/tim dihapus.");
+    } catch (deleteError) { setError(deleteError instanceof Error ? deleteError.message : "Site/tim tidak dapat dihapus."); }
+    finally { setBusy(false); }
+  };
+
+  const issueCode = async (site: Site) => {
+    if (busy) return;
+    setBusy(true); setNotice(""); setError("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/sites/${site.id}/enrollment-code`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      const data = await response.json() as { code?: string; expiresAt?: string; message?: string };
+      if (!response.ok || !data.code) throw new Error(data.message || "Kode enrolmen gagal dibuat.");
+      setCopied(false);
+      setIssued({ code: data.code, expiresAt: data.expiresAt || "", siteName: site.name });
+    } catch (codeError) { setError(codeError instanceof Error ? codeError.message : "Kode enrolmen gagal dibuat."); }
+    finally { setBusy(false); }
+  };
+
+  const devicesOf = (siteId: number) => devices.filter((device) => device.siteId === siteId).length;
+
+  return <div className="smb-admin-users-page">
+    <section className="smb-panel smb-admin-create-panel">
+      <PanelHeading kicker="SITE & TIM" title="Tambah site/tim" />
+      <p className="smb-admin-help">Site/tim menentukan HP tracker mana yang masuk, WiFi apa yang diizinkan, dan nama yang muncul di laporan dashboard maupun Telegram. Kode enrolmen dibuat di sini sebelum APK Lacak diunduh dan dipasang.</p>
+      <form className="smb-admin-create-form" onSubmit={createSite}>
+        <label>Nama site/tim<input value={name} onChange={(event) => setName(event.target.value)} maxLength={40} placeholder="Contoh: Gudang Pusat" required /></label>
+        <label>Daftar WiFi diizinkan<input value={wifi} onChange={(event) => setWifi(event.target.value)} placeholder="WIFI-KANTOR, WIFI-GUDANG" /><small>Pisahkan dengan koma. Kosongkan bila semua WiFi diizinkan.</small></label>
+        <button className="smb-button-primary" type="submit" disabled={busy}>{busy ? "Menyimpan…" : "Buat site/tim"}</button>
+      </form>
+      {notice && <div className="smb-admin-feedback is-success">{notice}</div>}
+      {error && <div className="smb-admin-feedback is-error">{error}</div>}
+    </section>
+
+    <section className="smb-panel smb-admin-list-panel">
+      <PanelHeading kicker="DAFTAR SITE" title={`${sites.length} site/tim terdaftar`} action={<button className="smb-text-link" onClick={() => { void onChanged(); }}><RefreshCw size={14} /> Segarkan</button>} />
+      <div className="smb-admin-list">
+        {sites.map((site) => <div className="smb-admin-row" key={site.id}>
+          <div className="smb-admin-avatar"><Building2 size={17} /></div>
+          <div className="smb-admin-account"><strong>{site.name}</strong><small>{devicesOf(site.id)} HP tracker · WiFi izin: {site.wifiAllowlist.length ? site.wifiAllowlist.join(", ") : "semua jaringan"}</small></div>
+          <span className={`smb-status-pill ${devicesOf(site.id) ? "status-on" : "status-off"}`}>{devicesOf(site.id) ? `${devicesOf(site.id)} TERPASANG` : "BELUM ADA HP"}</span>
+          <div className="smb-site-actions">
+            <button className="smb-button-muted smb-reset-totp" onClick={() => void issueCode(site)} disabled={busy}><KeyRound size={13} /> Kode enrolmen</button>
+            <button className="smb-button-outline smb-reset-totp" onClick={() => { setEditing(site); setEditName(site.name); setEditWifi(site.wifiAllowlist.join(", ")); }}><Pencil size={13} /> Ubah</button>
+            <button className="smb-button-danger smb-reset-totp" onClick={() => setDeleting(site)}><Trash2 size={13} /> Hapus</button>
+          </div>
+        </div>)}
+        {sites.length === 0 && <EmptyState icon={<Building2 size={21} />} title="Belum ada site/tim" body="Buat site/tim pertama pada formulir di atas, lalu buat kode enrolmen sebelum mengunduh APK Lacak." />}
+      </div>
+    </section>
+
+    {issued && <div className="smb-modal-backdrop" role="presentation" onClick={() => setIssued(null)}>
+      <section className="smb-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="smb-enroll-title" onClick={(event) => event.stopPropagation()}>
+        <div className="smb-modal-icon modal-unlock"><KeyRound size={23} /></div>
+        <button className="smb-modal-close" onClick={() => setIssued(null)} aria-label="Tutup"><X size={18} /></button>
+        <p className="smb-eyebrow">KODE ENROLMEN</p>
+        <h2 id="smb-enroll-title">Kode untuk {issued.siteName}</h2>
+        <code className="smb-enroll-code">{issued.code}</code>
+        <div className="smb-enroll-meta"><span>Berlaku sampai {issued.expiresAt ? formatTime(issued.expiresAt) : "24 jam"}</span><span>Sekali pakai</span></div>
+        <div className="smb-modal-actions">
+          <button className="smb-button-muted" onClick={() => setIssued(null)}>Tutup</button>
+          <button className="smb-button-primary" onClick={() => { void navigator.clipboard?.writeText(issued.code).catch(() => undefined); setCopied(true); }}><Copy size={14} /> {copied ? "Tersalin" : "Salin kode"}</button>
+        </div>
+        <small>Kode ini hanya tampil sekali. Masukkan di layar enrolmen APK Lacak pada HP tracker; setelah dipakai, buat kode baru untuk HP berikutnya.</small>
+      </section>
+    </div>}
+
+    {editing && <div className="smb-modal-backdrop" role="presentation" onClick={() => { if (!busy) setEditing(null); }}>
+      <section className="smb-confirm-modal smb-rename-modal" role="dialog" aria-modal="true" aria-labelledby="smb-site-edit-title" onClick={(event) => event.stopPropagation()}>
+        <button className="smb-modal-close" onClick={() => setEditing(null)} aria-label="Tutup"><X size={18} /></button>
+        <p className="smb-eyebrow">UBAH SITE/TIM</p>
+        <h2 id="smb-site-edit-title">{editing.name}</h2>
+        <p>Perubahan nama dan daftar WiFi berlaku langsung ke HP tracker yang terhubung.</p>
+        <label className="smb-picker-field">Nama site/tim<input className="smb-rename-input" value={editName} onChange={(event) => setEditName(event.target.value)} maxLength={40} /></label>
+        <label className="smb-picker-field">Daftar WiFi diizinkan<input className="smb-rename-input" value={editWifi} onChange={(event) => setEditWifi(event.target.value)} placeholder="WIFI-KANTOR, WIFI-GUDANG" /></label>
+        <div className="smb-modal-actions">
+          <button className="smb-button-muted" onClick={() => setEditing(null)} disabled={busy}>Batal</button>
+          <button className="smb-button-primary" onClick={() => void saveEdit()} disabled={busy || !editName.trim()}>{busy ? "Menyimpan…" : "Simpan perubahan"}</button>
+        </div>
+      </section>
+    </div>}
+
+    {deleting && <div className="smb-modal-backdrop" role="presentation" onClick={() => { if (!busy) setDeleting(null); }}>
+      <section className="smb-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="smb-site-delete-title" onClick={(event) => event.stopPropagation()}>
+        <div className="smb-modal-icon modal-lock"><Trash2 size={23} /></div>
+        <button className="smb-modal-close" onClick={() => setDeleting(null)} aria-label="Tutup"><X size={18} /></button>
+        <p className="smb-eyebrow">HAPUS SITE/TIM</p>
+        <h2 id="smb-site-delete-title">Hapus {deleting.name}?</h2>
+        <p>{devicesOf(deleting.id)} HP tracker akan dilepas dari site ini dan tetap terdaftar tanpa site. Kode enrolmen site ikut terhapus.</p>
+        <div className="smb-modal-actions">
+          <button className="smb-button-muted" onClick={() => setDeleting(null)} disabled={busy}>Batal</button>
+          <button className="smb-button-danger" onClick={() => void removeSite()} disabled={busy}>{busy ? "Menghapus…" : "Hapus site/tim"}</button>
+        </div>
+        <small>Tindakan ini tidak menghapus perangkat atau riwayat lokasi mereka.</small>
+      </section>
+    </div>}
   </div>;
 }
 

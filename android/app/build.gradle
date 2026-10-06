@@ -1,19 +1,21 @@
 apply plugin: 'com.android.application'
 
 android {
-    namespace = "id.nusarental.fleetconsole"
+    namespace = "com.smbbotlacak.tracker"
     compileSdk = rootProject.ext.compileSdkVersion
     flavorDimensions "role"
     productFlavors {
         tracker {
             dimension "role"
+            applicationId "com.smbbotlacak.tracker"
         }
         master {
             dimension "role"
+            applicationId "com.smbbotlacak.master"
         }
     }
     defaultConfig {
-        applicationId "id.nusarental.fleetconsole"
+        applicationId "com.smbbotlacak.tracker"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 6

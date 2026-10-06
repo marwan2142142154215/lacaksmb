@@ -1,8 +1,8 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'id.nusarental.fleetconsole',
-  appName: 'SMB Master',
+  appId: 'com.smbbotlacak.tracker',
+  appName: 'SMB Lacak',
   webDir: 'dist'
 };
 

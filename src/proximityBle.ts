@@ -26,8 +26,16 @@ type ProximityBlePlugin = {
   requestLocationAccess(): Promise<{ granted: boolean; precise: boolean }>;
   requestBackgroundLocation(): Promise<{ granted: boolean }>;
   getLocationStatus(): Promise<LocationPermissionStatus>;
+  /** ID perangkat stabil dari Android (ANDROID_ID); dipakai saat enrolmen site. */
+  getDeviceId(): Promise<{ deviceId: string }>;
   startAdvertising(options?: { brokerUrl?: string; deviceId?: string }): Promise<{ active: boolean; beaconId: string; background: boolean }>;
-  startScan(options?: { brokerUrl?: string; token?: string; deviceId?: string; masterId?: string }): Promise<{ active: boolean; background: boolean }>;
+  startScan(options?: {
+    brokerUrl?: string;
+    lanBrokerUrl?: string;
+    token?: string;
+    deviceId?: string;
+    masterId?: string;
+  }): Promise<{ active: boolean; background: boolean }>;
   stop(): Promise<{ active: boolean }>;
   isScanning(): Promise<{ active: boolean; locationActive: boolean }>;
   enableLocation(): Promise<{ accepted: boolean }>;
@@ -50,14 +58,19 @@ export const proximityBle = registerPlugin<ProximityBlePlugin>("ProximityBle");
 
 export type DevicePolicyStatus = {
   deviceOwner: boolean;
+  deviceAdmin: boolean;
   lockTaskMode: number;
   lockTaskPermitted: boolean;
 };
 
 type DevicePolicyPlugin = {
   getStatus(): Promise<DevicePolicyStatus>;
-  lock(): Promise<{ locked: boolean }>;
-  unlock(): Promise<{ locked: boolean }>;
+  lock(): Promise<{ locked: boolean; lockTaskMode: number }>;
+  unlock(): Promise<{ locked: boolean; lockTaskMode: number }>;
+  /** Blokir/buka kembali uninstall aplikasi dari sisi Android (Device Owner). */
+  setUninstallBlocked(options: { blocked: boolean }): Promise<{ blocked: boolean }>;
+  /** Buka layar hapus bawaan Android; dipanggil hanya setelah perintah dari master/web. */
+  openUninstallScreen(): Promise<{ opened: boolean }>;
 };
 
 export const devicePolicy = registerPlugin<DevicePolicyPlugin>("DevicePolicy");

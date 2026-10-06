@@ -225,3 +225,43 @@
 .smb-server-log-empty span { max-width: 360px; font-size: 9px; line-height: 1.6; }
 @media (max-width: 1050px) { .smb-download-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 760px) { .smb-server-status-grid, .smb-download-grid { grid-template-columns: 1fr; }.smb-server-section-heading { flex-direction: column; }.smb-server-log-row { grid-template-columns: 1fr; gap: 3px; } }
+
+/* ── Site & tim, kode enrolmen, dan konfirmasi hapus aplikasi ───────────── */
+.modal-uninstall { color: #a6412f; background: #fdece7; }
+.smb-button-uninstall { color: #a6412f !important; border-color: #f0cfc6; background: #fff7f4; }
+.smb-button-uninstall:hover { background: #fdece7; }
+.smb-site-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.smb-enroll-code {
+  display: block;
+  padding: 15px 12px;
+  margin-top: 14px;
+  border: 1px dashed #7bbba6;
+  border-radius: 9px;
+  color: #10654e;
+  background: #eef8f4;
+  font: 800 19px ui-monospace, monospace;
+  letter-spacing: 0.2em;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.smb-enroll-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 9px; color: #8d999b; font-size: 9px; }
+.smb-picker-field { display: grid; gap: 6px; margin-top: 13px; color: #849194; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.smb-picker-field .smb-rename-input { margin-top: 0; }
+.smb-site-select {
+  width: 100%;
+  min-height: 39px;
+  padding: 8px 10px;
+  border: 1px solid #e4eaea;
+  border-radius: 7px;
+  outline-color: #75ad9b;
+  color: #475d5e;
+  background: #fff;
+  font-size: 11px;
+  text-transform: none;
+}
+.smb-picker-empty { padding: 11px; margin-top: 12px; border: 1px dashed #e2eae7; border-radius: 8px; background: #fafcfb; }
+.smb-site-picker .smb-admin-feedback { margin-top: 11px; }
+@media (max-width: 740px) {
+  .smb-site-actions { width: 100%; }
+  .smb-enroll-code { font-size: 15px; letter-spacing: 0.12em; }
+}

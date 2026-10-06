@@ -1,10 +1,11 @@
 import https from "node:https";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { DatabaseSync } from "node:sqlite";
-import { createCipheriv, createDecipheriv, randomBytes, randomInt } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, randomInt, X509Certificate } from "node:crypto";
 import {
   bootstrapFirstAdmin,
   completeTotpEnrollment,
@@ -68,6 +69,39 @@ const certPath = path.join(root, ".tools", "broker-cert", "broker-cert.pem");
 const pfxPath = path.join(root, ".tools", "broker-cert", "broker.p12");
 const pfxPassphrase = process.env.FLEET_TLS_PASSPHRASE || "";
 
+// Identitas perangkat tetap. Tracker lain didaftarkan lewat kode enrolmen site,
+// jadi hanya kedua ID ini yang dibuat otomatis saat broker pertama kali start.
+const MASTER_ID = "R9RY506354P";
+const TRACKER_ID = "R9RXC03EC9N";
+const ALLOWED_COMMANDS = new Set(["lock", "unlock", "uninstall"]);
+const WIFI_VIOLATION_COOLDOWN_MS = 10 * 60_000;
+
+/**
+ * Alamat broker pada jaringan WiFi lokal PC. Tracker memakai alamat ini ketika
+ * HP tidak punya akses internet tetapi masih 1 WiFi dengan PC broker.
+ * Sertifikat lokal sudah mencantumkan IP LAN, jadi WSS tetap tepercaya di Android.
+ */
+function resolveLanHost() {
+  const configured = (process.env.FLEET_BROKER_LAN_HOST || "").trim();
+  const certificateHosts = [];
+  try {
+    const certificate = new X509Certificate(fs.readFileSync(certPath));
+    for (const entry of String(certificate.subjectAltName || "").split(",")) {
+      const ip = entry.trim().match(/^IP Address=(.+)$/i)?.[1];
+      if (ip) certificateHosts.push(ip);
+    }
+  } catch { /* Sertifikat dibaca ulang oleh HTTPS server; deteksi IP tetap berjalan. */ }
+  const interfaceAddresses = Object.values(os.networkInterfaces())
+    .flat()
+    .filter((address) => address && !address.internal && address.family === "IPv4")
+    .map((address) => address.address);
+  const preferred = [configured, ...certificateHosts].filter(Boolean);
+  const matched = preferred.find((host) => interfaceAddresses.includes(host) || host === "127.0.0.1");
+  return matched || interfaceAddresses.find((host) => /^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(host)) || "";
+}
+const lanHost = resolveLanHost();
+const lanBrokerUrl = lanHost ? `wss://${lanHost}:${port}/ws` : "";
+
 if (!masterToken || !trackerToken) throw new Error("Set distinct FLEET_MASTER_TOKEN and FLEET_TRACKER_TOKEN in .env.local.");
 if (locationEncryptionKey.length !== 32) throw new Error("Set FLEET_LOCATION_KEY to a random base64-encoded 32-byte key in .env.local.");
 if (adminAuthEncryptionKey.length !== 32) throw new Error("Set FLEET_ADMIN_AUTH_KEY to a random base64-encoded 32-byte key in .env.local.");
@@ -76,8 +110,8 @@ if (!fs.existsSync(pfxPath) || !fs.existsSync(certPath) || !pfxPassphrase) {
 }
 
 const devices = new Map([
-  ["R9RY506354P", { role: "master", name: "SMB Master", connected: false }],
-  ["R9RXC03EC9N", { role: "tracker", name: "SMB Lacak", connected: false }],
+  [MASTER_ID, { role: "master", name: "SMB Master", connected: false, siteId: null }],
+  [TRACKER_ID, { role: "tracker", name: "SMB Lacak", connected: false, siteId: null }],
 ]);
 const registryPath = path.join(root, "data", "fleet-registry.json");
 if (fs.existsSync(registryPath)) {
@@ -91,8 +125,8 @@ if (fs.existsSync(registryPath)) {
   }
 }
 const tokens = new Map([
-  ["R9RY506354P", masterToken],
-  ["R9RXC03EC9N", trackerToken],
+  [MASTER_ID, masterToken],
+  [TRACKER_ID, trackerToken],
 ]);
 const sockets = new Map();
 const queues = new Map();
@@ -112,10 +146,24 @@ database.exec(`
   CREATE TABLE IF NOT EXISTS telegram_chat_access (chat_id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('owner','operator')), granted_at TEXT NOT NULL, granted_by TEXT NOT NULL, revoked_at TEXT);
   CREATE TABLE IF NOT EXISTS telegram_access_codes (code_hash TEXT PRIMARY KEY, issued_by TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, used_by_chat_id TEXT);
   CREATE TABLE IF NOT EXISTS telegram_otp_attempts (chat_id TEXT PRIMARY KEY, window_started_at TEXT NOT NULL, failures INTEGER NOT NULL DEFAULT 0);
+  CREATE TABLE IF NOT EXISTS sites (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE, wifi_allowlist TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS enrollment_codes (code_hash TEXT PRIMARY KEY, site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE, device_label TEXT, issued_by TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, device_id TEXT);
   CREATE INDEX IF NOT EXISTS command_log_device_created ON command_log(device_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS telemetry_minute_recent ON telemetry_minute(device_id, minute_at DESC);
   CREATE INDEX IF NOT EXISTS location_history_recent ON location_history(device_id, captured_at DESC);
 `);
+// Migrasi kolom yang ditambahkan untuk banyak perangkat + site/tim. ALTER TABLE
+// gagal kalau kolom sudah ada, jadi tiap statement dijalankan terpisah.
+for (const statement of [
+  "ALTER TABLE devices ADD COLUMN site_id INTEGER REFERENCES sites(id)",
+  "ALTER TABLE devices ADD COLUMN token_hash TEXT",
+  "ALTER TABLE devices ADD COLUMN uninstall_blocked INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE enrollment_codes ADD COLUMN revoked_at TEXT",
+]) {
+  try { database.exec(statement); } catch (error) {
+    if (!/duplicate column name/i.test(error.message || "")) throw error;
+  }
+}
 if (telegramAdminChatId) {
   database.prepare("INSERT INTO telegram_chat_access (chat_id,role,granted_at,granted_by,revoked_at) VALUES (?,'owner',?,'environment',NULL) ON CONFLICT(chat_id) DO UPDATE SET role='owner',revoked_at=NULL")
     .run(telegramAdminChatId, new Date().toISOString());
@@ -136,7 +184,47 @@ for (const [deviceId, device] of devices) {
   queueSupabaseDevice(deviceId);
   queueSupabaseState(deviceId);
 }
-for (const row of database.prepare("SELECT device_id,name FROM devices").all()) if (devices.has(row.device_id)) devices.get(row.device_id).name = row.name;
+// Muat ulang semua perangkat dari database, termasuk tracker hasil enrolmen site.
+for (const row of database.prepare("SELECT device_id,name,role FROM devices").all()) {
+  if (devices.has(row.device_id)) { devices.get(row.device_id).name = row.name; continue; }
+  if (row.role !== "tracker") continue;
+  devices.set(row.device_id, { role: "tracker", name: row.name, connected: false, siteId: null, uninstallBlocked: false });
+}
+
+// ── Site / tim ──────────────────────────────────────────────────────────────────
+function parseWifiAllowlist(raw) {
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed) ? parsed.filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim()) : [];
+  } catch { return []; }
+}
+const sites = new Map();
+function reloadSites() {
+  sites.clear();
+  for (const row of database.prepare("SELECT * FROM sites ORDER BY name").all()) {
+    sites.set(row.id, { id: row.id, name: row.name, wifiAllowlist: parseWifiAllowlist(row.wifi_allowlist), createdAt: row.created_at, updatedAt: row.updated_at });
+  }
+}
+reloadSites();
+for (const row of database.prepare("SELECT device_id,site_id,token_hash,uninstall_blocked FROM devices").all()) {
+  const device = devices.get(row.device_id);
+  if (!device) continue;
+  device.uninstallBlocked = row.uninstall_blocked === 1;
+  if (row.site_id == null) continue;
+  if (sites.has(row.site_id)) device.siteId = row.site_id;
+  else {
+    // Site sudah dihapus oleh superadmin: lepaskan perangkat supaya tidak nyangkut.
+    device.siteId = null;
+    database.prepare("UPDATE devices SET site_id=NULL WHERE device_id=?").run(row.device_id);
+  }
+}
+function publicSite(site) {
+  return { id: site.id, name: site.name, wifiAllowlist: site.wifiAllowlist, createdAt: site.createdAt, updatedAt: site.updatedAt };
+}
+function siteOf(deviceId) {
+  const siteId = devices.get(deviceId)?.siteId;
+  return siteId == null ? null : sites.get(siteId) || null;
+}
 const pendingRows = database.prepare("SELECT * FROM command_log WHERE status IN ('pending','sent') ORDER BY created_at").all();
 const recentRows = database.prepare("SELECT * FROM command_log WHERE status IN ('acked','failed') ORDER BY created_at DESC LIMIT 1000").all();
 for (const row of [...recentRows.reverse(), ...pendingRows]) {
@@ -147,22 +235,32 @@ for (const row of [...recentRows.reverse(), ...pendingRows]) {
   queueSupabaseCommand(entry);
   if (status === "pending") queues.set(entry.deviceId, [...(queues.get(entry.deviceId) || []), entry]);
 }
-let latestTelemetry = {
-  deviceId: "R9RXC03EC9N",
-  masterId: "R9RY506354P",
-  detected: false,
-  rssi: null,
-  receivedAt: null,
-  online: false,
-};
-try {
-  const savedTelemetry = database.prepare("SELECT telemetry_json FROM device_state WHERE device_id=?").get("R9RXC03EC9N")?.telemetry_json;
-  if (savedTelemetry) latestTelemetry = { ...JSON.parse(savedTelemetry), online: false, detected: false, rssi: null };
-} catch { /* Keep an empty live state if stored data is unreadable. */ }
-try {
-  const savedLocation = database.prepare("SELECT * FROM location_history WHERE device_id=? ORDER BY captured_at DESC LIMIT 1").get("R9RXC03EC9N");
-  if (savedLocation) latestTelemetry = { ...latestTelemetry, ...decryptLocationRow(savedLocation) };
-} catch (error) { console.error(`Saved location could not be decrypted: ${error.message}`); }
+// Status tracker disimpan per perangkat karena satu broker melayani banyak HP.
+const telemetryByDevice = new Map();
+function emptyTelemetry(deviceId) {
+  return { deviceId, masterId: MASTER_ID, detected: false, rssi: null, receivedAt: null, online: false };
+}
+function telemetryFor(deviceId) {
+  if (!telemetryByDevice.has(deviceId)) telemetryByDevice.set(deviceId, emptyTelemetry(deviceId));
+  return telemetryByDevice.get(deviceId);
+}
+function setTelemetry(deviceId, patch) {
+  const merged = { ...telemetryFor(deviceId), ...patch, deviceId };
+  telemetryByDevice.set(deviceId, merged);
+  return merged;
+}
+for (const [deviceId, device] of devices) {
+  if (device.role !== "tracker") continue;
+  telemetryByDevice.set(deviceId, emptyTelemetry(deviceId));
+  try {
+    const savedTelemetry = database.prepare("SELECT telemetry_json FROM device_state WHERE device_id=?").get(deviceId)?.telemetry_json;
+    if (savedTelemetry) telemetryByDevice.set(deviceId, { ...emptyTelemetry(deviceId), ...JSON.parse(savedTelemetry), online: false, detected: false, rssi: null });
+  } catch { /* Simpan awal kosong bila data tersimpan tidak terbaca. */ }
+  try {
+    const savedLocation = database.prepare("SELECT * FROM location_history WHERE device_id=? ORDER BY captured_at DESC LIMIT 1").get(deviceId);
+    if (savedLocation) telemetryByDevice.set(deviceId, { ...telemetryFor(deviceId), ...decryptLocationRow(savedLocation) });
+  } catch (error) { console.error(`Saved location for ${deviceId} could not be decrypted: ${error.message}`); }
+}
 
 function respondJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
@@ -211,6 +309,125 @@ async function readJsonRequest(request, maxBytes = 16_384) {
     throw error;
   }
 }
+
+/** Autentikasi token perangkat: paket env untuk device bawaan, hash untuk hasil enrolmen. */
+function authenticateDevice(deviceId, token) {
+  if (!deviceId || !token) return false;
+  const configured = tokens.get(deviceId);
+  if (configured && configured === token) return true;
+  const row = database.prepare("SELECT token_hash FROM devices WHERE device_id=?").get(deviceId);
+  return Boolean(row?.token_hash) && row.token_hash === tokenDigest(token);
+}
+
+function normalizeSsid(value) {
+  const ssid = typeof value === "string" ? value.trim().replace(/^"|"$/g, "") : "";
+  if (!ssid || /^unknown ssid$/i.test(ssid) || ssid.length > 32) return null;
+  return ssid;
+}
+
+const wifiViolationNotifiedAt = new Map();
+
+/**
+ * Bandingkan WiFi tracker dengan daftar izin site/tim. Pelanggaran dikirim ke
+ * dashboard admin (realtime) dan ke Telegram, disertai nama site/tim.
+ */
+async function evaluateWifiPolicy(deviceId, wifiSsid) {
+  const site = siteOf(deviceId);
+  if (!site || !site.wifiAllowlist.length) return;
+  const allowed = !wifiSsid || site.wifiAllowlist.some((ssid) => ssid.toLocaleLowerCase("id-ID") === wifiSsid.toLocaleLowerCase("id-ID"));
+  if (allowed) { wifiViolationNotifiedAt.delete(deviceId); return; }
+  const lastNotified = wifiViolationNotifiedAt.get(deviceId) || 0;
+  if (Date.now() - lastNotified < WIFI_VIOLATION_COOLDOWN_MS) return;
+  wifiViolationNotifiedAt.set(deviceId, Date.now());
+  const device = devices.get(deviceId);
+  const event = { type: "siteViolation", deviceId, deviceName: device?.name || deviceId, siteId: site.id, siteName: site.name, wifiSsid, allowedNetworks: site.wifiAllowlist, at: new Date().toISOString() };
+  sendToMasters(event);
+  console.warn(`WiFi policy violation: ${device?.name || deviceId} (site ${site.name}) joined ${wifiSsid}.`);
+  if (!telegramToken || !telegramAdminChatId) return;
+  try {
+    await telegramReply(telegramAdminChatId, [
+      "⚠️ WIFI DI LUAR IZIN SITE/TIM",
+      `Site/tim: ${site.name}`,
+      `Perangkat: ${device?.name || deviceId} (${deviceId})`,
+      `WiFi terdeteksi: ${wifiSsid}`,
+      `WiFi diizinkan: ${site.wifiAllowlist.join(", ")}`,
+      `Waktu: ${new Date().toLocaleString("id-ID")}`,
+    ].join("\n"));
+  } catch (error) { console.error("Telegram WiFi alert failed:", error.message); }
+}
+
+const publicBrokerUrl = (process.env.FLEET_PUBLIC_BROKER_URL || "wss://broker.lacaksmbbot.com/ws").replace(/\/$/, "");
+const publicBrokerHttpUrl = publicBrokerUrl.replace(/^wss:/, "https:").replace(/^ws:/, "http:").replace(/\/ws$/, "");
+
+function badRequest(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  error.code = "invalid_request";
+  error.publicMessage = message;
+  return error;
+}
+
+function urlQuery(request) {
+  return new URL(request.url || "/", "https://localhost").searchParams;
+}
+
+function enrollPayload(deviceId, token) {
+  const device = devices.get(deviceId);
+  const site = siteOf(deviceId);
+  return {
+    token,
+    device: { deviceId, name: device?.name || deviceId, role: device?.role || "tracker", siteId: device?.siteId ?? null },
+    site: site ? publicSite(site) : null,
+    brokerUrl: publicBrokerUrl,
+    lanBrokerUrl,
+    publicBrokerHttpUrl,
+  };
+}
+
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function generateEnrollmentCode() {
+  const bytes = randomBytes(8);
+  let code = "";
+  for (let index = 0; index < 8; index++) code += CODE_ALPHABET[bytes[index] % CODE_ALPHABET.length];
+  return code;
+}
+function normalizeEnrollmentCode(value) {
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+function normalizeWifiAllowlist(value) {
+  if (!Array.isArray(value)) throw badRequest("Daftar WiFi harus berupa daftar nama jaringan.");
+  if (value.length > 20) throw badRequest("Maksimal 20 jaringan WiFi per site/tim.");
+  const networks = [];
+  for (const entry of value) {
+    const ssid = normalizeSsid(String(entry ?? ""));
+    if (!ssid) continue;
+    if (!networks.some((existing) => existing.toLocaleLowerCase("id-ID") === ssid.toLocaleLowerCase("id-ID"))) networks.push(ssid);
+  }
+  return networks;
+}
+function createSite(body) {
+  const name = String(body.name || "").trim();
+  if (!name || name.length > 40) throw badRequest("Nama site/tim harus 1-40 karakter.");
+  const clash = [...sites.values()].find((site) => site.name.toLocaleLowerCase("id-ID") === name.toLocaleLowerCase("id-ID"));
+  if (clash) throw badRequest("Nama site/tim sudah dipakai.");
+  const now = new Date().toISOString();
+  const wifiAllowlist = normalizeWifiAllowlist(body.wifiAllowlist ?? []);
+  const result = database.prepare("INSERT INTO sites (name,wifi_allowlist,created_at,updated_at) VALUES (?,?,?,?)")
+    .run(name, JSON.stringify(wifiAllowlist), now, now);
+  return { id: Number(result.lastInsertRowid), name, wifiAllowlist, createdAt: now, updatedAt: now };
+}
+
+/** Pembatas percobaan kode enrolmen (kode 8 karakter, tetap dibatasi agar tidak ditebak. */
+const enrollAttempts = {
+  failures: [],
+  windowStart: 0,
+  expired() { return Date.now() - this.windowStart > 60_000; },
+  allow() { return this.failures.length < 10; },
+  recordFailure() {
+    if (this.expired()) { this.failures = []; this.windowStart = Date.now(); }
+    this.failures.push(Date.now());
+  },
+};
 
 function readOperationLogs(maxEntries = 200) {
   const entries = [];
@@ -451,15 +668,174 @@ const server = https.createServer({
     respondJson(response, 200, { ok: true, message: "2FA direset; pengguna harus mendaftarkan authenticator lagi." });
     return;
   }
+  // ── Site / tim (superadmin) ─────────────────────────────────────────────────
+  if (request.method === "GET" && request.url === "/api/admin/sites") {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    respondJson(response, 200, { sites: [...sites.values()].map(publicSite), lanBrokerUrl });
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/admin/sites") {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden", message: "Hanya superadmin yang boleh mengelola site/tim." }); return; }
+    void readJsonRequest(request).then((body) => {
+      const site = createSite(body);
+      reloadSites();
+      publishDevices();
+      respondJson(response, 201, { site: publicSite(site), message: `Site/tim ${site.name} dibuat.` });
+    }).catch((error) => respondJson(response, error.statusCode || 400, { error: error.code || "invalid_site", message: error.publicMessage || error.message || "Site/tim tidak dapat dibuat." }));
+    return;
+  }
+  const siteMatch = request.url.match(/^\/api\/admin\/sites\/(\d+)(\/enrollment-code)?$/);
+  if (siteMatch && (request.method === "PUT" || request.method === "DELETE" || (request.method === "POST" && siteMatch[2]))) {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden", message: "Hanya superadmin yang boleh mengelola site/tim." }); return; }
+    const siteId = Number(siteMatch[1]);
+    const site = sites.get(siteId);
+    if (!site) { respondJson(response, 404, { error: "site_not_found", message: "Site/tim tidak ditemukan." }); return; }
+
+    if (request.method === "POST" && siteMatch[2]) {
+      const code = generateEnrollmentCode();
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + 24 * 60 * 60_000).toISOString();
+      database.prepare("DELETE FROM enrollment_codes WHERE expires_at<? OR used_at IS NOT NULL").run(new Date(now.getTime() - 7 * 24 * 60 * 60_000).toISOString());
+      database.prepare("INSERT INTO enrollment_codes (code_hash,site_id,device_label,issued_by,created_at,expires_at) VALUES (?,?,?,?,?,?)")
+        .run(tokenDigest(code), siteId, null, admin.username, now.toISOString(), expiresAt);
+      respondJson(response, 201, { code, expiresAt, site: publicSite(site), message: `Kode enrolmen untuk site/tim ${site.name} berlaku 24 jam dan hanya bisa dipakai sekali.` });
+      return;
+    }
+    if (request.method === "PUT") {
+      void readJsonRequest(request).then((body) => {
+        const name = body.name === undefined ? site.name : String(body.name || "").trim();
+        const allowlist = body.wifiAllowlist === undefined ? site.wifiAllowlist : normalizeWifiAllowlist(body.wifiAllowlist);
+        if (!name || name.length > 40) throw badRequest("Nama site/tim harus 1-40 karakter.");
+        const clash = [...sites.values()].find((item) => item.id !== siteId && item.name.toLocaleLowerCase("id-ID") === name.toLocaleLowerCase("id-ID"));
+        if (clash) throw badRequest("Nama site/tim sudah dipakai.");
+        const updatedAt = new Date().toISOString();
+        database.prepare("UPDATE sites SET name=?,wifi_allowlist=?,updated_at=? WHERE id=?").run(name, JSON.stringify(allowlist), updatedAt, siteId);
+        reloadSites();
+        publishDevices();
+        respondJson(response, 200, { site: publicSite(sites.get(siteId)), message: "Site/tim diperbarui." });
+      }).catch((error) => respondJson(response, error.statusCode || 400, { error: error.code || "invalid_site", message: error.publicMessage || error.message || "Site/tim tidak dapat diperbarui." }));
+      return;
+    }
+    // DELETE: perangkat dilepas dari site, kode enrolmen site ikut terhapus.
+    database.prepare("UPDATE devices SET site_id=NULL WHERE site_id=?").run(siteId);
+    database.prepare("DELETE FROM enrollment_codes WHERE site_id=?").run(siteId);
+    database.prepare("DELETE FROM sites WHERE id=?").run(siteId);
+    for (const [deviceId, device] of devices) if (device.siteId === siteId) { device.siteId = null; wifiViolationNotifiedAt.delete(deviceId); }
+    reloadSites();
+    publishDevices();
+    respondJson(response, 200, { ok: true, message: `Site/tim ${site.name} dihapus. Perangkatnya tetap terdaftar tanpa site.` });
+    return;
+  }
+
+  // ── Kontrol perangkat (buka/blokir hapus, hapus perangkat lama) ─────────────
+  const uninstallBlockMatch = request.method === "POST" && request.url.match(/^\/api\/admin\/devices\/([^/]+)\/uninstall-block$/);
+  if (uninstallBlockMatch) {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    const deviceId = decodeURIComponent(uninstallBlockMatch[1]);
+    const device = devices.get(deviceId);
+    if (!device || device.role !== "tracker") { respondJson(response, 404, { error: "device_not_found", message: "Perangkat tracker tidak ditemukan." }); return; }
+    void readJsonRequest(request).then((body) => {
+      if (typeof body.blocked !== "boolean") throw badRequest("Field blocked harus boolean.");
+      setUninstallBlockedState(deviceId, body.blocked);
+      respondJson(response, 200, { ok: true, blocked: device.uninstallBlocked, message: device.uninstallBlocked ? "Penghapusan aplikasi diblokir." : "Penghapusan aplikasi diizinkan sementara." });
+    }).catch((error) => respondJson(response, error.statusCode || 400, { error: error.code || "invalid_request", message: error.publicMessage || error.message || "Permintaan tidak valid." }));
+    return;
+  }
+  const deviceDeleteMatch = request.method === "DELETE" && request.url.match(/^\/api\/admin\/devices\/([^/]+)$/);
+  if (deviceDeleteMatch) {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden", message: "Hanya superadmin yang boleh menghapus perangkat." }); return; }
+    const deviceId = decodeURIComponent(deviceDeleteMatch[1]);
+    const device = devices.get(deviceId);
+    if (!device) { respondJson(response, 404, { error: "device_not_found", message: "Perangkat tidak ditemukan." }); return; }
+    if (device.role !== "tracker") { respondJson(response, 400, { error: "not_tracker", message: "Hanya perangkat tracker yang bisa dihapus dari daftar." }); return; }
+    sockets.get(deviceId)?.close(4001, "Device removed by admin");
+    sockets.delete(deviceId);
+    queues.delete(deviceId);
+    telemetryByDevice.delete(deviceId);
+    wifiViolationNotifiedAt.delete(deviceId);
+    // FK device_state/command_log/telemetry_minute tidak punya ON DELETE CASCADE,
+    // jadi anaknya dihapus lebih dulu supaya penghapusan tidak ditolak SQLite.
+    database.prepare("DELETE FROM telemetry_minute WHERE device_id=?").run(deviceId);
+    database.prepare("DELETE FROM command_log WHERE device_id=?").run(deviceId);
+    database.prepare("DELETE FROM location_history WHERE device_id=?").run(deviceId);
+    database.prepare("DELETE FROM device_state WHERE device_id=?").run(deviceId);
+    database.prepare("DELETE FROM devices WHERE device_id=?").run(deviceId);
+    devices.delete(deviceId);
+    queueSupabaseDevice(deviceId);
+    publishDevices();
+    respondJson(response, 200, { ok: true, message: `Perangkat ${device.name} (${deviceId}) dihapus. Enrolmen baru diperlukan untuk memakainya lagi.` });
+    return;
+  }
+
+  // ── Enrolmen HP tracker (tanpa sesi admin: kode enrolmen yang menjadi rahasia) ─
+  if (request.method === "POST" && request.url === "/api/enroll") {
+    void readJsonRequest(request).then(async (body) => {
+      const deviceId = String(body.deviceId || "").trim();
+      if (!/^[A-Za-z0-9_-]{4,64}$/.test(deviceId)) throw badRequest("ID perangkat tidak valid.");
+      const existing = devices.get(deviceId);
+      if (existing?.role === "master") throw badRequest("ID perangkat tidak dapat dipakai untuk tracker.");
+      const presentedToken = String(body.token || "");
+      if (presentedToken && authenticateDevice(deviceId, presentedToken)) {
+        respondJson(response, 200, enrollPayload(deviceId, presentedToken));
+        return;
+      }
+      if (!enrollAttempts.allow()) { respondJson(response, 429, { error: "too_many_attempts", message: "Terlalu banyak percobaan enrolmen. Coba lagi satu menit." }); return; }
+      const code = normalizeEnrollmentCode(body.code);
+      const row = code ? database.prepare("SELECT * FROM enrollment_codes WHERE code_hash=? AND used_at IS NULL AND revoked_at IS NULL AND expires_at>?").get(tokenDigest(code), new Date().toISOString()) : null;
+      if (!row) { enrollAttempts.recordFailure(); throw badRequest("Kode enrolmen salah, kedaluwarsa, atau sudah dipakai."); }
+      const site = sites.get(row.site_id);
+      if (!site) throw badRequest("Site/tim pada kode enrolmen sudah dihapus. Minta kode baru kepada superadmin.");
+      const deviceToken = randomBytes(32).toString("base64url");
+      const now = new Date().toISOString();
+      const displayName = String(body.name || "").trim().slice(0, 40) || existing?.name || `${site.name} ${deviceId.slice(-4)}`;
+      const siteId = site.id;
+      database.prepare("INSERT INTO devices (device_id,name,role,site_id,token_hash,created_at,updated_at) VALUES (?,?,'tracker',?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET name=excluded.name,site_id=excluded.site_id,token_hash=excluded.token_hash,updated_at=excluded.updated_at")
+        .run(deviceId, displayName, siteId, tokenDigest(deviceToken), now, now);
+      database.prepare("INSERT OR IGNORE INTO device_state (device_id,connected,updated_at) VALUES (?,0,?)").run(deviceId, now);
+      database.prepare("UPDATE enrollment_codes SET used_at=?,device_id=? WHERE code_hash=?").run(now, deviceId, row.code_hash);
+      const device = devices.get(deviceId) || { role: "tracker", name: displayName, connected: false, siteId: null };
+      device.name = displayName;
+      device.role = "tracker";
+      device.siteId = siteId;
+      devices.set(deviceId, device);
+      queueSupabaseDevice(deviceId);
+      queueSupabaseState(deviceId);
+      telemetryFor(deviceId);
+      publishDevices();
+      console.log(`Device ${deviceId} enrolled for site ${site.name} by enrollment code.`);
+      respondJson(response, 201, enrollPayload(deviceId, deviceToken));
+    }).catch((error) => respondJson(response, error.statusCode || 400, { error: error.code || "enroll_failed", message: error.publicMessage || error.message || "Enrolmen gagal." }));
+    return;
+  }
+  if (request.method === "GET" && request.url === "/api/broker-info") {
+    const deviceId = urlQuery(request).get("deviceId") || "";
+    const device = devices.get(deviceId);
+    if (!device || !authenticateDevice(deviceId, urlQuery(request).get("token") || "")) { respondJson(response, 401, { error: "unauthorized" }); return; }
+    respondJson(response, 200, enrollPayload(deviceId, urlQuery(request).get("token") || ""));
+    return;
+  }
+
   if (request.method === "GET" && (request.url === "/api/admin/snapshot" || request.url.startsWith("/api/admin/commands"))) {
     const admin = requireAdminSession(request, response);
     if (!admin) return;
     if (request.url === "/api/admin/snapshot") {
+      const url = new URL(request.url, `https://${request.headers.host || "localhost"}`);
+      const trackerIds = [...devices.entries()].filter(([, device]) => device.role === "tracker").map(([deviceId]) => deviceId);
+      const historyDeviceId = trackerIds.includes(url.searchParams.get("deviceId") || "") ? url.searchParams.get("deviceId") : (trackerIds.includes(TRACKER_ID) ? TRACKER_ID : trackerIds[0]);
       const rows = database.prepare("SELECT * FROM command_log ORDER BY created_at DESC LIMIT 30").all().map(publicCommandRow);
-      const signalHistory = database.prepare("SELECT minute_at AS minuteAt,sample_count AS sampleCount,detected_count AS detectedCount,CASE WHEN rssi_count=0 THEN NULL ELSE CAST(rssi_sum AS REAL)/rssi_count END AS rssiAvg,rssi_min AS rssiMin,rssi_max AS rssiMax,battery_level AS batteryLevel FROM telemetry_minute WHERE device_id=? ORDER BY minute_at DESC LIMIT 60").all("R9RXC03EC9N").reverse();
-      const locationHistory = database.prepare("SELECT * FROM location_history WHERE device_id=? ORDER BY captured_at DESC LIMIT 100").all("R9RXC03EC9N").map(decryptLocationRow).reverse();
+      const signalHistory = historyDeviceId ? database.prepare("SELECT minute_at AS minuteAt,sample_count AS sampleCount,detected_count AS detectedCount,CASE WHEN rssi_count=0 THEN NULL ELSE CAST(rssi_sum AS REAL)/rssi_count END AS rssiAvg,rssi_min AS rssiMin,rssi_max AS rssiMax,battery_level AS batteryLevel FROM telemetry_minute WHERE device_id=? ORDER BY minute_at DESC LIMIT 60").all(historyDeviceId).reverse() : [];
+      const locationHistory = historyDeviceId ? database.prepare("SELECT * FROM location_history WHERE device_id=? ORDER BY captured_at DESC LIMIT 100").all(historyDeviceId).map(decryptLocationRow).reverse() : [];
+      const telemetry = Object.fromEntries([...telemetryByDevice.entries()]);
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-      response.end(JSON.stringify({ service: "smb-fleet-broker", generatedAt: new Date().toISOString(), admin: publicAdminUser(admin), devices: publicDevices(), telemetry: latestTelemetry, locationHistory, signalHistory, commands: rows, telegram: { configured: Boolean(telegramToken), adminChatConfigured: Boolean(telegramAdminChatId) }, supabase: { configured: supabaseEnabled } }));
+      response.end(JSON.stringify({ service: "smb-fleet-broker", generatedAt: new Date().toISOString(), admin: publicAdminUser(admin), devices: publicDevices(), telemetry: historyDeviceId ? (telemetry[historyDeviceId] || null) : null, telemetryByDevice: telemetry, sites: [...sites.values()].map(publicSite), lanBrokerUrl, historyDeviceId, locationHistory, signalHistory, commands: rows, telegram: { configured: Boolean(telegramToken), adminChatConfigured: Boolean(telegramAdminChatId) }, supabase: { configured: supabaseEnabled } }));
       return;
     }
     const url = new URL(request.url, `https://${request.headers.host || "localhost"}`);
@@ -480,43 +856,41 @@ const server = https.createServer({
     request.on("end", () => {
       const auth = request.headers.authorization || "";
       const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-      if (token !== trackerToken) {
-        response.writeHead(401, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: "unauthorized" }));
-        return;
-      }
       let payload;
       try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {
         response.writeHead(400, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: "invalid_json" }));
         return;
       }
-      if (payload.deviceId !== "R9RXC03EC9N" || payload.masterId !== "R9RY506354P") {
-        response.writeHead(403, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: "invalid_device" }));
+      const deviceId = String(payload.deviceId || "");
+      const device = devices.get(deviceId);
+      if (!device || device.role !== "tracker" || !authenticateDevice(deviceId, token)) {
+        response.writeHead(401, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unauthorized" }));
         return;
       }
       const detected = payload.detected === true;
       const rssi = Number.isInteger(payload.rssi) && payload.rssi >= -127 && payload.rssi <= 20 ? payload.rssi : null;
       const batteryLevel = Number.isInteger(payload.batteryLevel) && payload.batteryLevel >= 0 && payload.batteryLevel <= 100 ? payload.batteryLevel : null;
       const location = validatedLocation(payload);
-      latestTelemetry = {
-        ...latestTelemetry,
-        deviceId: payload.deviceId,
-        masterId: payload.masterId,
+      const wifiSsid = normalizeSsid(payload.wifiSsid);
+      const telemetry = setTelemetry(deviceId, {
+        masterId: MASTER_ID,
         detected,
         rssi: detected ? rssi : null,
         deviceOwner: payload.deviceOwner === true,
         lockTaskMode: Number.isInteger(payload.lockTaskMode) ? payload.lockTaskMode : 0,
         batteryLevel,
+        wifiSsid,
         ...(location || {}),
         receivedAt: new Date().toISOString(),
         online: true,
-      };
-      persistTelemetry(latestTelemetry);
-      sendToMasters({ type: "telemetry", ...latestTelemetry });
+      });
+      persistTelemetry(telemetry);
+      sendToMasters({ type: "telemetry", ...telemetry });
+      void evaluateWifiPolicy(deviceId, wifiSsid);
       response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store" });
-      response.end(JSON.stringify({ accepted: true, receivedAt: latestTelemetry.receivedAt }));
+      response.end(JSON.stringify({ accepted: true, receivedAt: telemetry.receivedAt, lanBrokerUrl }));
     });
     return;
   }
@@ -534,7 +908,7 @@ server.on("upgrade", (request, socket, head) => {
   const adminSession = device?.role === "master" && token !== masterToken
     ? resolveAdminSession(database, token)
     : null;
-  const isAuthorizedDevice = device && token === tokens.get(deviceId);
+  const isAuthorizedDevice = Boolean(device) && authenticateDevice(deviceId, token);
   if (url.pathname !== "/ws" || !device || (!isAuthorizedDevice && !adminSession)) {
     socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
     socket.destroy();
@@ -552,13 +926,14 @@ webSockets.on("connection", (webSocket) => {
   if (webSocket.adminSession) {
     adminSockets.add(webSocket);
     webSocket.adminSessionExpiresAt = webSocket.adminSession.expiresAt;
-    send(webSocket, { type: "telemetry", ...latestTelemetry });
+    sendTelemetrySnapshot(webSocket);
   } else {
     sockets.get(webSocket.deviceId)?.close(4001, "Replaced by a newer session");
     sockets.set(webSocket.deviceId, webSocket);
     devices.get(webSocket.deviceId).connected = true;
     persistDeviceConnection(webSocket.deviceId, true);
-    if (webSocket.role === "master") send(webSocket, { type: "telemetry", ...latestTelemetry });
+    if (webSocket.role === "master") sendTelemetrySnapshot(webSocket);
+    if (webSocket.role === "tracker") send(webSocket, { type: "uninstallBlocked", blocked: devices.get(webSocket.deviceId)?.uninstallBlocked !== false });
   }
   publishDevices();
   if (webSocket.role === "tracker" && !webSocket.adminSession) drainQueue(webSocket.deviceId);
@@ -569,31 +944,34 @@ webSockets.on("connection", (webSocket) => {
     if (webSocket.role === "tracker" && message.type === "telemetry") {
       const detected = message.detected === true;
       const rssi = Number.isInteger(message.rssi) && message.rssi >= -127 && message.rssi <= 20 ? message.rssi : null;
-      latestTelemetry = {
-        ...latestTelemetry,
-        deviceId: webSocket.deviceId,
-        masterId: "R9RY506354P",
+      const wifiSsid = normalizeSsid(message.wifiSsid);
+      const telemetry = setTelemetry(webSocket.deviceId, {
+        masterId: MASTER_ID,
         detected,
         rssi: detected ? rssi : null,
         receivedAt: new Date().toISOString(),
         online: true,
-      };
-      persistTelemetry(latestTelemetry);
-      sendToMasters({ type: "telemetry", ...latestTelemetry });
+        ...(wifiSsid ? { wifiSsid } : {}),
+      });
+      persistTelemetry(telemetry);
+      sendToMasters({ type: "telemetry", ...telemetry });
+      if (wifiSsid) void evaluateWifiPolicy(webSocket.deviceId, wifiSsid);
       return;
     }
     if (webSocket.role === "master" && message.type === "commandRequest") {
-      if (message.targetId !== "R9RXC03EC9N" || !["lock", "unlock"].includes(message.command)) {
+      const target = devices.get(message.targetId);
+      if (!target || target.role !== "tracker" || !ALLOWED_COMMANDS.has(message.command)) {
         send(webSocket, { type: "commandResult", ok: false, error: "Target or command is not allowed." });
         return;
       }
-      enqueueCommand(message.targetId, message.command, webSocket.adminSession?.username || "master");
+      const queued = enqueueCommand(message.targetId, message.command, webSocket.adminSession?.username || "master");
+      if (!queued) send(webSocket, { type: "commandResult", ok: false, error: "Target or command is not allowed." });
       return;
     }
     if (webSocket.role === "master" && message.type === "renameRequest") {
       const device = devices.get(message.targetId);
       const newName = String(message.newName || "").trim();
-      if (!device || message.targetId !== "R9RXC03EC9N" || !newName || newName.length > 40
+      if (!device || device.role !== "tracker" || !newName || newName.length > 40
         || [...devices.entries()].some(([id, item]) => id !== message.targetId && normalizeName(item.name) === normalizeName(newName))) {
         send(webSocket, { type: "commandResult", ok: false, error: "Target/name not allowed or ambiguous." });
         return;
@@ -605,7 +983,7 @@ webSockets.on("connection", (webSocket) => {
       return;
     }
     if (webSocket.role === "tracker" && message.type === "commandAck") {
-      acknowledge(message.commandId, message.ok === true, String(message.detail || ""), webSocket.deviceId);
+      acknowledge(message.commandId, message.ok === true, String(message.detail || ""), webSocket.deviceId, message.lockTaskMode);
     }
   });
 
@@ -618,9 +996,9 @@ webSockets.on("connection", (webSocket) => {
     sockets.delete(webSocket.deviceId);
     devices.get(webSocket.deviceId).connected = false;
     persistDeviceConnection(webSocket.deviceId, false);
-    if (webSocket.deviceId === "R9RXC03EC9N") {
-      latestTelemetry = { ...latestTelemetry, detected: false, rssi: null, online: false, receivedAt: new Date().toISOString() };
-      sendToMasters({ type: "telemetry", ...latestTelemetry });
+    if (devices.get(webSocket.deviceId)?.role === "tracker") {
+      const offline = setTelemetry(webSocket.deviceId, { detected: false, rssi: null, online: false, receivedAt: new Date().toISOString() });
+      sendToMasters({ type: "telemetry", ...offline });
     }
     publishDevices();
   });
@@ -631,8 +1009,11 @@ function send(webSocket, packet) {
 }
 function broadcast(packet, deviceId) { send(sockets.get(deviceId), packet); }
 function sendToMasters(packet) {
-  send(sockets.get("R9RY506354P"), packet);
+  send(sockets.get(MASTER_ID), packet);
   for (const client of adminSockets) send(client, packet);
+}
+function sendTelemetrySnapshot(webSocket) {
+  for (const [deviceId, telemetry] of telemetryByDevice) send(webSocket, { type: "telemetry", ...telemetry });
 }
 function publicDevices(includeLocation = true) {
   const stateById = new Map(database.prepare("SELECT device_id,last_seen_at,telemetry_json FROM device_state").all().map((state) => [state.device_id, state]));
@@ -640,7 +1021,20 @@ function publicDevices(includeLocation = true) {
     const state = stateById.get(deviceId);
     let telemetry = null;
     try { telemetry = state?.telemetry_json ? JSON.parse(state.telemetry_json) : null; } catch { telemetry = null; }
-    return { deviceId, name: device.name, role: device.role, online: device.connected, lastSeenAt: state?.last_seen_at || null, telemetry: publicTelemetry(telemetry, includeLocation) };
+    const live = telemetryByDevice.get(deviceId);
+    const site = siteOf(deviceId);
+    return {
+      deviceId,
+      name: device.name,
+      role: device.role,
+      online: device.connected,
+      lastSeenAt: state?.last_seen_at || null,
+      siteId: site?.id ?? null,
+      siteName: site?.name ?? null,
+      wifiSsid: live?.wifiSsid ?? telemetry?.wifiSsid ?? null,
+      uninstallBlocked: device.role === "tracker" && device.uninstallBlocked !== false,
+      telemetry: publicTelemetry({ ...(telemetry || {}), ...(live || {}) }, includeLocation),
+    };
   });
 }
 function publicTelemetry(telemetry, includeLocation = true) {
@@ -649,6 +1043,23 @@ function publicTelemetry(telemetry, includeLocation = true) {
   return safe;
 }
 function publishDevices() { sendToMasters({ type: "devices", devices: publicDevices() }); }
+
+/**
+ * Status blokir hapus-aplikasi disimpan di broker dan dikirim ke HP tracker,
+ * sehingga penghapusan hanya bisa dimulai dari master/web (bukan dari HP).
+ */
+function setUninstallBlockedState(deviceId, blocked) {
+  const device = devices.get(deviceId);
+  if (!device) return;
+  device.uninstallBlocked = Boolean(blocked);
+  database.prepare("UPDATE devices SET uninstall_blocked=?,updated_at=? WHERE device_id=?")
+    .run(device.uninstallBlocked ? 1 : 0, new Date().toISOString(), deviceId);
+  queueSupabaseDevice(deviceId);
+  const socket = sockets.get(deviceId);
+  if (socket && socket.role === "tracker") send(socket, { type: "uninstallBlocked", blocked: device.uninstallBlocked });
+  publishDevices();
+}
+
 function persistDeviceNames() {
   fs.mkdirSync(path.dirname(registryPath), { recursive: true });
   const names = Object.fromEntries([...devices.entries()].map(([id, device]) => [id, device.name]));
@@ -784,7 +1195,11 @@ async function flushSupabase() {
 }
 
 function enqueueCommand(deviceId, command, issuedBy) {
-  if (!devices.has(deviceId) || devices.get(deviceId).role !== "tracker") throw new Error("Unknown tracker target.");
+  // Validasi di sini (bukan di pemanggil) supaya jalur WebSocket, Telegram, dan
+  // REST tidak ada yang melempar error yang bisa menjatuhkan proses broker.
+  const target = devices.get(deviceId);
+  if (!target || target.role !== "tracker") return null;
+  if (!ALLOWED_COMMANDS.has(command)) return null;
   const queue = queues.get(deviceId) || [];
   const id = `cmd_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
   const entry = { id, deviceId, command, issuedBy, status: "pending", createdAt: new Date().toISOString() };
@@ -812,9 +1227,33 @@ function drainQueue(deviceId) {
   sendToMasters({ type: "commandUpdate", command: active });
   active.timeout = setTimeout(() => acknowledge(active.id, false, "No acknowledgement before timeout."), 45_000);
 }
-function acknowledge(commandId, ok, detail, sourceDeviceId) {
+function acknowledge(commandId, ok, detail, sourceDeviceId, reportedLockTaskMode) {
   const entry = commands.get(commandId);
   if (!entry || entry.status !== "sent" || (sourceDeviceId && entry.deviceId !== sourceDeviceId)) return;
+  if (sourceDeviceId && ["lock", "unlock"].includes(entry.command)) {
+    if (Number.isInteger(reportedLockTaskMode) && reportedLockTaskMode >= 0 && reportedLockTaskMode <= 2) {
+      const expectedMode = entry.command === "lock" ? 1 : 0;
+      if (ok && reportedLockTaskMode !== expectedMode) {
+        ok = false;
+        detail = `Android reported Lock Task mode ${reportedLockTaskMode}; expected ${expectedMode}.`;
+      }
+      const telemetry = setTelemetry(sourceDeviceId, {
+        lockTaskMode: reportedLockTaskMode,
+        receivedAt: new Date().toISOString(),
+        online: true,
+      });
+      persistTelemetry(telemetry);
+      sendToMasters({ type: "telemetry", ...telemetry });
+    } else if (ok) {
+      ok = false;
+      detail = "Android did not report the resulting Lock Task mode.";
+    }
+  }
+  if (sourceDeviceId && entry.command === "uninstall") {
+    // HP tracker membuka layar hapus aplikasi; blokir tetap aktif supaya
+    // penghapusan manual dari HP tetap dicegah setelah layar ditutup.
+    send(sockets.get(entry.deviceId), { type: "uninstallBlocked", blocked: devices.get(entry.deviceId)?.uninstallBlocked !== false });
+  }
   clearTimeout(entry.timeout);
   entry.status = ok ? "acked" : "failed";
   entry.completedAt = new Date().toISOString();
@@ -823,7 +1262,7 @@ function acknowledge(commandId, ok, detail, sourceDeviceId) {
     .run(entry.status, entry.completedAt, entry.detail, entry.id);
   queueSupabaseCommand(entry);
   console.log(`Command ${commandId} ${entry.status}: ${detail || "no detail"}`);
-  if (["lock", "unlock"].includes(entry.command)) void notifyTelegramCommand(entry).catch((error) => console.error("Telegram command notification failed:", error.message));
+  if (["lock", "unlock", "uninstall"].includes(entry.command)) void notifyTelegramCommand(entry).catch((error) => console.error("Telegram command notification failed:", error.message));
   const queue = queues.get(entry.deviceId) || [];
   queues.set(entry.deviceId, queue.filter((queued) => queued.id !== commandId));
   sendToMasters({ type: "commandUpdate", command: entry });
@@ -859,10 +1298,14 @@ async function notifyTelegramCommand(entry) {
   const chatId = sourceChat || telegramAdminChatId;
   if (!chatId) return;
   const device = devices.get(entry.deviceId);
-  const locationText = entry.deviceId === TRACKER_ID && Number.isFinite(latestTelemetry.latitude) && Number.isFinite(latestTelemetry.longitude)
-    ? `\nLokasi terakhir: https://maps.google.com/?q=${latestTelemetry.latitude},${latestTelemetry.longitude} (akurasi ±${Number.isFinite(latestTelemetry.accuracyMeters) ? Math.round(latestTelemetry.accuracyMeters) : "?"} m; ${latestTelemetry.locationAt || "waktu tidak tersedia"})`
+  const site = siteOf(entry.deviceId);
+  const telemetry = telemetryFor(entry.deviceId);
+  const locationText = Number.isFinite(telemetry.latitude) && Number.isFinite(telemetry.longitude)
+    ? `\nLokasi terakhir: https://maps.google.com/?q=${telemetry.latitude},${telemetry.longitude} (akurasi ±${Number.isFinite(telemetry.accuracyMeters) ? Math.round(telemetry.accuracyMeters) : "?"} m; ${telemetry.locationAt || "waktu tidak tersedia"})`
     : "\nLokasi: belum ada koordinat aktual yang dilaporkan.";
-  await telegramReply(chatId, `${entry.command === "lock" ? "KUNCI" : "BUKA KIOS"} ${entry.status === "acked" ? "berhasil" : "gagal"}\nPerangkat: ${device?.name || "perangkat"} (${entry.deviceId})\nHasil Android: ${entry.detail || entry.status}${locationText}`);
+  const siteLine = site ? `\nSite/tim: ${site.name}` : "";
+  const title = entry.command === "lock" ? "KUNCI" : entry.command === "unlock" ? "BUKA KIOS" : "HAPUS APLIKASI";
+  await telegramReply(chatId, `${title} ${entry.status === "acked" ? "berhasil" : "gagal"}\nPerangkat: ${device?.name || "perangkat"} (${entry.deviceId})${siteLine}\nHasil Android: ${entry.detail || entry.status}${locationText}`);
 }
 
 function redeemTelegramOtp(code, chatId) {
@@ -925,7 +1368,7 @@ async function handleTelegramUpdate(update) {
     return;
   }
   if (command === "/daftar") {
-    const lines = publicDevices().map((d) => `${d.name} (${d.deviceId}) — ${d.online ? "online" : "offline"}`);
+    const lines = publicDevices().map((d) => `${d.name} (${d.deviceId})${d.siteName ? ` — site: ${d.siteName}` : ""} — ${d.online ? "online" : "offline"}`);
     await telegramReply(chatId, lines.join("\n") || "Belum ada perangkat terdaftar.");
     return;
   }
@@ -933,15 +1376,19 @@ async function handleTelegramUpdate(update) {
     const match = findDevice(argument);
     if (!match) { await telegramReply(chatId, candidateReply(argument)); return; }
     const [deviceId, device] = match;
-    if (deviceId === "R9RXC03EC9N") {
-      const proximity = latestTelemetry.online && latestTelemetry.detected ? `BLE terdeteksi, ${latestTelemetry.rssi} dBm` : "BLE belum terdeteksi";
-      const coords = Number.isFinite(latestTelemetry.latitude) && Number.isFinite(latestTelemetry.longitude)
-        ? `Lokasi: ${latestTelemetry.latitude}, ${latestTelemetry.longitude}\nPeta: https://maps.google.com/?q=${latestTelemetry.latitude},${latestTelemetry.longitude}\nAkurasi: ±${Number.isFinite(latestTelemetry.accuracyMeters) ? Math.round(latestTelemetry.accuracyMeters) : "?"} m · ${latestTelemetry.locationAt || "waktu tidak tersedia"}`
-        : `Lokasi GPS: belum dilaporkan. Kedekatan BLE: ${proximity}.`;
-      await telegramReply(chatId, `${device.name} (${deviceId})\nStatus: ${device.connected ? "online" : "offline"}\nBaterai: ${latestTelemetry.batteryLevel == null ? "belum dilaporkan" : `${latestTelemetry.batteryLevel}%`}\n${coords}`);
-    } else {
-      await telegramReply(chatId, `${device.name} (${deviceId})\nStatus: ${device.connected ? "online" : "offline"}\nTelemetri baterai/lokasi belum tersedia.`);
+    if (device.role !== "tracker") {
+      await telegramReply(chatId, `${device.name} (${deviceId}) adalah master, bukan tracker. Gunakan /daftar untuk melihat tracker.`);
+      return;
     }
+    const telemetry = telemetryFor(deviceId);
+    const site = siteOf(deviceId);
+    const proximity = telemetry.online && telemetry.detected ? `BLE terdeteksi, ${telemetry.rssi} dBm` : "BLE belum terdeteksi";
+    const coords = Number.isFinite(telemetry.latitude) && Number.isFinite(telemetry.longitude)
+      ? `Lokasi: ${telemetry.latitude}, ${telemetry.longitude}\nPeta: https://maps.google.com/?q=${telemetry.latitude},${telemetry.longitude}\nAkurasi: ±${Number.isFinite(telemetry.accuracyMeters) ? Math.round(telemetry.accuracyMeters) : "?"} m · ${telemetry.locationAt || "waktu tidak tersedia"}`
+      : `Lokasi GPS: belum dilaporkan. Kedekatan BLE: ${proximity}.`;
+    const wifiLine = site ? `\nSite/tim: ${site.name}\nWiFi: ${telemetry.wifiSsid || "belum dilaporkan"}${site.wifiAllowlist.length ? ` (izinkan: ${site.wifiAllowlist.join(", ")})` : ""}` : "";
+    const lockLine = `\nLock Task mode: ${Number.isInteger(telemetry.lockTaskMode) ? telemetry.lockTaskMode : "belum dilaporkan"} · deviceOwner: ${telemetry.deviceOwner ? "ya" : "belum"}`;
+    await telegramReply(chatId, `${device.name} (${deviceId})\nStatus: ${device.connected ? "online" : "offline"}\nBaterai: ${telemetry.batteryLevel == null ? "belum dilaporkan" : `${telemetry.batteryLevel}%`}${wifiLine}${lockLine}\n${coords}`);
     return;
   }
   if (command === "/rename") {
@@ -960,9 +1407,11 @@ async function handleTelegramUpdate(update) {
   }
   if (["/lock", "/unlock"].includes(command)) {
     const match = findDevice(argument);
-    if (!match || match[0] !== "R9RXC03EC9N") { await telegramReply(chatId, match ? `Perintah ini hanya diizinkan untuk tracker R9RXC03EC9N, bukan ${match[0]}.` : candidateReply(argument)); return; }
+    if (!match || match[1].role !== "tracker") { await telegramReply(chatId, match ? `Perintah ini hanya untuk HP tracker, bukan ${match[0]}.` : candidateReply(argument)); return; }
     const queued = enqueueCommand(match[0], command.slice(1), `telegram:${chatId}`);
-    await telegramReply(chatId, `Perintah ${command.slice(1)} masuk antrean FIFO untuk ${match[1].name}. ID: ${queued.id}. Hasil menunggu ACK dari HP.`);
+    if (!queued) { await telegramReply(chatId, "Perintah tidak dapat dimasukkan ke antrean."); return; }
+    const site = siteOf(match[0]);
+    await telegramReply(chatId, `Perintah ${command.slice(1)} masuk antrean FIFO untuk ${match[1].name}${site ? ` (site: ${site.name})` : ""}. ID: ${queued.id}. Hasil menunggu ACK dari HP.`);
     return;
   }
   if (["/kamera_depan", "/kamera_belakang"].includes(command)) {
@@ -1003,9 +1452,12 @@ setInterval(() => {
   database.prepare("DELETE FROM telemetry_minute WHERE minute_at < ?").run(cutoff);
 }, 15 * 60 * 1000).unref();
 setInterval(() => {
-  if (latestTelemetry.online && latestTelemetry.receivedAt && Date.now() - Date.parse(latestTelemetry.receivedAt) > 10_000) {
-    latestTelemetry = { ...latestTelemetry, detected: false, rssi: null, online: false };
-    sendToMasters({ type: "telemetry", ...latestTelemetry });
+  const now = Date.now();
+  for (const [deviceId, telemetry] of telemetryByDevice) {
+    if (telemetry.online && telemetry.receivedAt && now - Date.parse(telemetry.receivedAt) > 10_000) {
+      const offline = setTelemetry(deviceId, { detected: false, rssi: null, online: false });
+      sendToMasters({ type: "telemetry", ...offline });
+    }
   }
 }, 2000).unref();
 setInterval(() => {
