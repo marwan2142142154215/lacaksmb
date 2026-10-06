@@ -1,5 +1,7 @@
 package com.smbbotlacak.tracker;
 
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
@@ -15,11 +17,26 @@ import com.getcapacitor.BridgeActivity;
  * SharedPreferences oleh halaman enrolmen, lalu dipakai service latar.
  */
 public class MainActivity extends BridgeActivity {
+    public static final String ACTION_SELF_REMOVE_DEVICE_OWNER = "com.smbbotlacak.tracker.ACTION_SELF_REMOVE_DEVICE_OWNER";
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(ProximityBlePlugin.class);
         registerPlugin(DevicePolicyPlugin.class);
         super.onCreate(savedInstanceState);
+
+        // Permintaan dari broker/admin untuk melepas diri dari Device Owner lalu keluar,
+        // agar aplikasi bisa di-uninstall seperti aplikasi biasa.
+        Intent launch = getIntent();
+        if (launch != null && ACTION_SELF_REMOVE_DEVICE_OWNER.equals(launch.getAction())) {
+            try {
+                DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
+                ComponentName admin = new ComponentName(this, FleetDeviceAdminReceiver.class);
+                if (dpm != null) dpm.removeActiveAdmin(admin);
+            } catch (Exception ignored) { }
+            finish();
+            return;
+        }
 
         SharedPreferences preferences = getSharedPreferences("smb_proximity", MODE_PRIVATE);
         String storedToken = preferences.getString(ProximityForegroundService.EXTRA_TOKEN, "");
@@ -57,5 +74,18 @@ public class MainActivity extends BridgeActivity {
         try {
             ContextCompat.startForegroundService(this, service);
         } catch (Exception ignored) { }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        if (intent != null && ACTION_SELF_REMOVE_DEVICE_OWNER.equals(intent.getAction())) {
+            try {
+                DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
+                ComponentName admin = new ComponentName(this, FleetDeviceAdminReceiver.class);
+                if (dpm != null) dpm.removeActiveAdmin(admin);
+            } catch (Exception ignored) { }
+            finish();
+        }
     }
 }
