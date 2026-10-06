@@ -39,6 +39,8 @@ type ProximityBlePlugin = {
   stop(): Promise<{ active: boolean }>;
   isScanning(): Promise<{ active: boolean; locationActive: boolean }>;
   enableLocation(): Promise<{ accepted: boolean }>;
+  /** Ambil 1 foto sesuai permintaan admin (tidak ada jadwal pengambilan otomatis). */
+  capturePhoto(options?: { lens?: "front" | "back" }): Promise<{ imageBase64: string; capturedAt: string; bytes: number }>;
   addListener(eventName: "locationResult", listener: (event: DeviceLocation) => void): Promise<{ remove: () => Promise<void> }>;
   addListener(
     eventName: "scanResult",

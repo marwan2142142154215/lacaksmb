@@ -59,7 +59,7 @@ export type BrokerCommand = {
   type: "command";
   commandId: string;
   targetId: string;
-  command: "lock" | "unlock" | "uninstall";
+  command: "lock" | "unlock" | "uninstall" | "photo" | "photo_front";
 };
 type BrokerCommandResult = { ok: boolean; detail?: string; lockTaskMode?: number };
 

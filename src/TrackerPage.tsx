@@ -15,7 +15,7 @@ export default function TrackerPage() {
   const [lastLocation, setLastLocation] = useState<DeviceLocation | null>(null);
   const [lastResult, setLastResult] = useState<BleScanResult | null>(null);
   const [lastSeenAt, setLastSeenAt] = useState<number | null>(null);
-  const [message, setMessage] = useState("Pemantauan GPS, BLE & Kamera berjalan otomatis.");
+  const [message, setMessage] = useState("Pemantauan GPS, BLE & WiFi berjalan otomatis. Kamera hanya mengambil foto saat diminta.");
   const lastUpdate = useRef(0);
   const latestRef = useRef<{ detected: boolean; rssi: number | null; at: number }>({ detected: false, rssi: null, at: 0 });
   const [locked, setLocked] = useState(false);
@@ -29,6 +29,20 @@ export default function TrackerPage() {
     const myId = currentAuth?.deviceId || auth?.deviceId || "";
     if (myId && command.targetId && command.targetId !== myId) return { ok: false, detail: "Target perangkat tidak cocok." };
     try {
+      // Foto hanya diambil ketika ada perintah ini; tidak ada timer pengambilan foto.
+      if (command.command === "photo" || command.command === "photo_front") {
+        if (!currentAuth?.token) return { ok: false, detail: "Perangkat belum terdaftar (belum enrolmen site)." };
+        setMessage("Mengambil foto sesuai permintaan…");
+        const shot = await proximityBle.capturePhoto({ lens: command.command === "photo_front" ? "front" : "back" });
+        const response = await fetch(`${API_BASE}/api/telemetry/photo`, {
+          method: "POST",
+          headers: { "content-type": "application/json", Authorization: `Bearer ${currentAuth.token}` },
+          body: JSON.stringify({ deviceId: currentAuth.deviceId, commandId: command.commandId, imageBase64: shot.imageBase64, capturedAt: shot.capturedAt }),
+        });
+        if (!response.ok) throw new Error(`Foto gagal dikirim (HTTP ${response.status}).`);
+        setMessage("Foto dikirim sesuai permintaan ke broker/Telegram.");
+        return { ok: true, detail: "Foto diambil dan diteruskan ke Telegram admin." };
+      }
       if (command.command === "lock") {
         const result = await devicePolicy.lock();
         setLocked(result.lockTaskMode === 1);
@@ -188,7 +202,7 @@ export default function TrackerPage() {
       <section className="tracker-intro">
         <div className="tracker-eyebrow"><span /> PELACAK AKTIF PERMANEN</div>
         <h1>{auth.site?.name ? `Site: ${auth.site.name}` : "Perangkat tracker"}</h1>
-        <p>SMB Lacak mengirim status GPS, WiFi dan BLE ke broker saat izin Android aktif. Kamera tidak mengambil foto otomatis.</p>
+        <p>SMB Lacak mengirim status GPS, WiFi dan BLE ke broker saat izin Android aktif. Kamera tidak mengambil foto otomatis; foto hanya diambil ketika admin mengirim perintah Kirim foto, lalu hasilnya dikirim ke Telegram admin.</p>
       </section>
 
       <section className={`tracker-signal-card ${isDetected ? "signal-detected" : ""}`}>
@@ -271,7 +285,7 @@ export default function TrackerPage() {
 
       <div className="tracker-warning">
         <AlertTriangle size={16} />
-        <span>Pengambilan kamera otomatis dinonaktifkan; belum ada permintaan foto jarak jauh yang memerlukan persetujuan pengguna.</span>
+        <span>Pengambilan kamera otomatis/nonaktif; foto hanya diambil ketika perintah Kirim foto dari web atau Telegram, satu foto per permintaan.</span>
       </div>
       <footer className="tracker-footer">{policyNotice} · Auto-start pada boot & update aktif</footer>
     </main>

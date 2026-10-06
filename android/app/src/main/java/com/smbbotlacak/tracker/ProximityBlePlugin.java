@@ -280,6 +280,54 @@ public class ProximityBlePlugin extends Plugin {
         }
     }
 
+    /**
+     * Ambil satu foto HANYA ketika admin mengirim perintah photo/photo_front.
+     * Tidak ada penjadwalan: kamera tidak pernah menyala sendiri.
+     */
+    @PluginMethod
+    public void capturePhoto(PluginCall call) {
+        if (getContext().checkSelfPermission(Manifest.permission.CAMERA)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissionForAlias("camera", call, "onCameraPermissionResult");
+            return;
+        }
+        runCapture(call);
+    }
+
+    @PermissionCallback
+    private void onCameraPermissionResult(PluginCall call) {
+        if (getContext().checkSelfPermission(Manifest.permission.CAMERA)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            call.reject("Izin kamera Android belum diberikan.", "CAMERA_PERMISSION_REQUIRED");
+            return;
+        }
+        runCapture(call);
+    }
+
+    private void runCapture(PluginCall call) {
+        String lens = call.getString("lens", "back");
+        int facing = "front".equals(lens)
+                ? android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
+                : android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK;
+        CameraCapture.capture(getContext(), facing, new CameraCapture.CaptureCallback() {
+            @Override
+            public void onSuccess(byte[] jpeg) {
+                JSObject result = new JSObject();
+                result.put("imageBase64", android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP));
+                result.put("bytes", jpeg.length);
+                result.put("capturedAt", new java.text.SimpleDateFormat(
+                        "yyyy-MM-dd'T'HH:mm:ss.SSSXXX", java.util.Locale.US).format(new java.util.Date()));
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> call.resolve(result));
+            }
+
+            @Override
+            public void onError(String message) {
+                new android.os.Handler(android.os.Looper.getMainLooper())
+                        .post(() -> call.reject(message == null ? "Foto gagal diambil." : message, "CAPTURE_FAILED"));
+            }
+        });
+    }
+
     private boolean hasBlePermission(boolean advertising) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             String permission = advertising ? Manifest.permission.BLUETOOTH_ADVERTISE : Manifest.permission.BLUETOOTH_SCAN;

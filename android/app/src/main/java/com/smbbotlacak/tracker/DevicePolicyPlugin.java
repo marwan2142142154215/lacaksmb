@@ -40,32 +40,38 @@ public class DevicePolicyPlugin extends Plugin {
     @PluginMethod
     public void lock(PluginCall call) {
         boolean isOwner = policyManager != null && policyManager.isDeviceOwnerApp(getContext().getPackageName());
-        if (!isOwner) {
-            call.reject("Mode kios jarak jauh memerlukan enrollment Android Device Owner.");
-            return;
-        }
-        try {
-            policyManager.setLockTaskPackages(adminComponent, new String[] { getContext().getPackageName() });
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                policyManager.setLockTaskFeatures(adminComponent, DevicePolicyManager.LOCK_TASK_FEATURE_NONE);
-            }
-        } catch (Exception error) {
-            call.reject("Android menolak kebijakan Lock Task: " + error.getMessage());
-            return;
-        }
-
-        getActivity().runOnUiThread(() -> {
+        // Tanpa Device Owner, setLockTaskPackages ditolak Android, tetapi
+        // startLockTask() tetap dicoba: Android yang memutuskan hasil akhirnya.
+        if (isOwner) {
             try {
-                getActivity().startLockTask();
+                policyManager.setLockTaskPackages(adminComponent, new String[] { getContext().getPackageName() });
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    policyManager.setLockTaskFeatures(adminComponent, DevicePolicyManager.LOCK_TASK_FEATURE_NONE);
+                }
+            } catch (Exception error) {
+                call.reject("Android menolak kebijakan Lock Task: " + error.getMessage());
+                return;
+            }
+        }
+        android.app.Activity activity = getActivity();
+        if (activity == null) {
+            call.reject("Buka aplikasi SMB Lacak di layar depan; Android hanya bisa masuk mode kios dari aplikasi yang sedang aktif.");
+            return;
+        }
+        activity.runOnUiThread(() -> {
+            try {
+                activity.startLockTask();
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
                     int mode = getLockTaskMode();
-                    if (mode == android.app.ActivityManager.LOCK_TASK_MODE_LOCKED) {
+                    if (mode == android.app.ActivityManager.LOCK_TASK_MODE_LOCKED || mode == android.app.ActivityManager.LOCK_TASK_MODE_PINNED) {
                         JSObject result = new JSObject();
                         result.put("locked", true);
                         result.put("lockTaskMode", mode);
+                        result.put("deviceOwner", isOwner);
                         call.resolve(result);
                     } else {
-                        call.reject("Android tidak mengaktifkan mode kios; status Lock Task tetap " + mode + ".");
+                        call.reject("Android tidak mengaktifkan mode kios (status Lock Task " + mode + ")"
+                                + (isOwner ? "." : ". HP ini belum terdaftar sebagai Android Device Owner."));
                     }
                 }, 350);
             } catch (Exception error) {
@@ -84,14 +90,16 @@ public class DevicePolicyPlugin extends Plugin {
             call.resolve(result);
             return;
         }
-        boolean isOwner = policyManager != null && policyManager.isDeviceOwnerApp(getContext().getPackageName());
-        if (!isOwner) {
-            call.reject("Melepas Lock Task terkelola memerlukan Android Device Owner.");
+        // stopLockTask() sah untuk aplikasi yang memulai Lock Task sendiri,
+        // termasuk tanpa Device Owner; hasil akhir dibaca kembali dari Android.
+        android.app.Activity activity = getActivity();
+        if (activity == null) {
+            call.reject("Buka aplikasi SMB Lacak di layar depan; Android hanya bisa keluar mode kios dari aplikasi yang sedang aktif.");
             return;
         }
-        getActivity().runOnUiThread(() -> {
+        activity.runOnUiThread(() -> {
             try {
-                getActivity().stopLockTask();
+                activity.stopLockTask();
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
                     int mode = getLockTaskMode();
                     if (mode == android.app.ActivityManager.LOCK_TASK_MODE_NONE) {

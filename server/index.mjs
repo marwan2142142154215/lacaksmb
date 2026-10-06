@@ -65,6 +65,7 @@ const supabaseCommands = new Map();
 let supabaseFlushActive = false;
 let supabaseRetryAt = 0;
 let supabaseRetryDelay = 1000;
+const supabaseRowFailures = new Map();
 const certPath = path.join(root, ".tools", "broker-cert", "broker-cert.pem");
 const pfxPath = path.join(root, ".tools", "broker-cert", "broker.p12");
 const pfxPassphrase = process.env.FLEET_TLS_PASSPHRASE || "";
@@ -73,7 +74,9 @@ const pfxPassphrase = process.env.FLEET_TLS_PASSPHRASE || "";
 // jadi hanya kedua ID ini yang dibuat otomatis saat broker pertama kali start.
 const MASTER_ID = "R9RY506354P";
 const TRACKER_ID = "R9RXC03EC9N";
-const ALLOWED_COMMANDS = new Set(["lock", "unlock", "uninstall"]);
+// "photo"/"photo_front" hanya dijalankan saat admin memintanya; tidak ada
+// pengambilan foto berkala di sisi mana pun.
+const ALLOWED_COMMANDS = new Set(["lock", "unlock", "uninstall", "photo", "photo_front"]);
 const WIFI_VIOLATION_COOLDOWN_MS = 10 * 60_000;
 
 /**
@@ -894,6 +897,67 @@ const server = https.createServer({
     });
     return;
   }
+  // Foto jarak jauh: hanya dipanggil saat admin/Telegram mengirim perintah photo.
+  // Tidak ada timer pengambilan foto; APK mengirim satu bila diminta.
+  if (request.method === "POST" && request.url === "/api/telemetry/photo") {
+    const chunks = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > 5 * 1024 * 1024) request.destroy();
+      else chunks.push(chunk);
+    });
+    request.on("end", async () => {
+      const auth = request.headers.authorization || "";
+      const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+      let payload;
+      try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "invalid_json" }));
+        return;
+      }
+      const deviceId = String(payload.deviceId || "");
+      const device = devices.get(deviceId);
+      if (!device || device.role !== "tracker" || !authenticateDevice(deviceId, token)) {
+        response.writeHead(401, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      const image = Buffer.from(String(payload.imageBase64 || ""), "base64");
+      const validJpeg = image.length >= 100 && image.length <= 4 * 1024 * 1024 && image[0] === 0xff && image[1] === 0xd8;
+      if (!validJpeg) {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "invalid_image", message: "Foto tidak diterima: harus JPEG maksimal 4 MB." }));
+        return;
+      }
+      const capturedAt = typeof payload.capturedAt === "string" && Number.isFinite(Date.parse(payload.capturedAt))
+        ? payload.capturedAt : new Date().toISOString();
+      const photoDirectory = path.join(root, "data", "photos");
+      fs.mkdirSync(photoDirectory, { recursive: true });
+      const filename = `${String(deviceId).replace(/[^A-Za-z0-9_-]/g, "")}-${Date.now()}.jpg`;
+      fs.writeFileSync(path.join(photoDirectory, filename), image);
+      prunePhotos(photoDirectory);
+      // Penerima: chat yang meminta perintah ini, atau chat admin berasal dari web.
+      const command = payload.commandId ? commands.get(String(payload.commandId)) : null;
+      const sourceChat = String(command?.issuedBy || "").match(/^telegram:(-?\d+)$/)?.[1];
+      const chatId = sourceChat || telegramAdminChatId;
+      const site = siteOf(deviceId);
+      const caption = `Foto ${device.name} (${deviceId})${site ? ` · site ${site.name}` : ""}\nDiambil: ${capturedAt}\nPermintaan: ${command?.command || "photo"}${command?.issuedBy ? ` oleh ${command.issuedBy}` : ""}`;
+      let notified = false;
+      if (telegramToken && chatId) {
+        try {
+          await telegramSendPhoto(chatId, image, caption);
+          notified = true;
+        } catch (error) {
+          console.error("Telegram photo upload failed:", error.message);
+        }
+      }
+      console.log(`Photo from ${deviceId} saved as ${filename} (${image.length} bytes)${notified ? " and sent to Telegram" : ""}.`);
+      response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify({ accepted: true, savedAs: filename, notified, capturedAt }));
+    });
+    return;
+  }
   response.writeHead(404, { "content-type": "application/json" });
   response.end(JSON.stringify({ error: "not_found" }));
 });
@@ -1174,19 +1238,58 @@ async function flushSupabase() {
     // foreign key, so the parent table has to land first. Flushing all three
     // in parallel makes PostgREST return 409 for the children whenever they
     // arrive ahead of their device row.
-    const upload = ([, rows, table, conflict]) => fetch(`${supabaseUrl}/rest/v1/${table}?on_conflict=${conflict}`, {
-      method: "POST",
-      headers: { apikey: supabaseServiceKey, authorization: `Bearer ${supabaseServiceKey}`, "content-type": "application/json", Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify(rows),
-      signal: AbortSignal.timeout(10_000),
-    }).then((response) => { if (!response.ok) throw new Error(`Supabase ${table} upsert returned HTTP ${response.status}`); });
+    const uploadRows = async (rows, table, conflict) => {
+      const response = await fetch(`${supabaseUrl}/rest/v1/${table}?on_conflict=${conflict}`, {
+        method: "POST",
+        headers: { apikey: supabaseServiceKey, authorization: `Bearer ${supabaseServiceKey}`, "content-type": "application/json", Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(rows),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (response.ok) return;
+      const body = (await response.text()).slice(0, 300);
+      throw new Error(`Supabase ${table} upsert returned HTTP ${response.status}: ${body}`);
+    };
     const parents = pending.filter(([, , table]) => table === "fleet_devices");
     const children = pending.filter(([, , table]) => table !== "fleet_devices");
-    await Promise.all(parents.map(upload));
-    await Promise.all(children.map(upload));
-    supabaseRetryDelay = 1000;
-    supabaseRetryAt = 0;
+    const failedRows = [];
+    for (const [queue, rows, table, conflict] of [...parents, ...children]) {
+      try {
+        await uploadRows(rows, table, conflict);
+        for (const row of rows) supabaseRowFailures.delete(`${table}:${row[conflict]}`);
+      } catch (batchError) {
+        // Satu baris rusak tidak boleh memblokir seluruh sinkronisasi: ulangi
+        // per baris supaya baris sehat tetap terkirim pada siklus ini.
+        console.error(batchError.message);
+        for (const row of rows) {
+          try {
+            await uploadRows([row], table, conflict);
+            supabaseRowFailures.delete(`${table}:${row[conflict]}`);
+          } catch (rowError) {
+            const key = `${table}:${row[conflict]}`;
+            const attempts = (supabaseRowFailures.get(key) || 0) + 1;
+            if (attempts >= 5) {
+              // Baris yang terus gagal dibuang agar antrean tidak macet selamanya.
+              supabaseRowFailures.delete(key);
+              console.error(`Supabase ${table}: baris ${row[conflict]} dibuang setelah ${attempts} percobaan gagal: ${rowError.message}`);
+            } else {
+              supabaseRowFailures.set(key, attempts);
+              failedRows.push([queue, row]);
+            }
+          }
+        }
+      }
+    }
+    if (failedRows.length) {
+      for (const [queue, row] of failedRows) queue.set(row.device_id || row.id, row);
+      supabaseRetryAt = Date.now() + supabaseRetryDelay;
+      supabaseRetryDelay = Math.min(30_000, supabaseRetryDelay * 2);
+      console.error(`Supabase sync sebagian gagal; ${failedRows.length} baris diulang dalam ${supabaseRetryDelay} ms.`);
+    } else {
+      supabaseRetryDelay = 1000;
+      supabaseRetryAt = 0;
+    }
   } catch (error) {
+    // Galat jaringan/timeout: semua baris siklus ini dikembalikan ke antrean.
     for (const [queue, rows] of pending) for (const row of rows) queue.set(row.device_id || row.id, row);
     supabaseRetryAt = Date.now() + supabaseRetryDelay;
     supabaseRetryDelay = Math.min(30_000, supabaseRetryDelay * 2);
@@ -1245,8 +1348,9 @@ function acknowledge(commandId, ok, detail, sourceDeviceId, reportedLockTaskMode
       persistTelemetry(telemetry);
       sendToMasters({ type: "telemetry", ...telemetry });
     } else if (ok) {
-      ok = false;
-      detail = "Android did not report the resulting Lock Task mode.";
+      // APK yang belum diperbarui tidak menyertakan lockTaskMode. Hasil tracker
+      // tetap diterima dan status kios dibaca dari telemetri, bukan gagal palsu.
+      detail = `${detail ? `${detail} ` : ""}(APK tidak melaporkan mode Lock Task; status kios terbaru ada di panel)`;
     }
   }
   if (sourceDeviceId && entry.command === "uninstall") {
@@ -1262,7 +1366,7 @@ function acknowledge(commandId, ok, detail, sourceDeviceId, reportedLockTaskMode
     .run(entry.status, entry.completedAt, entry.detail, entry.id);
   queueSupabaseCommand(entry);
   console.log(`Command ${commandId} ${entry.status}: ${detail || "no detail"}`);
-  if (["lock", "unlock", "uninstall"].includes(entry.command)) void notifyTelegramCommand(entry).catch((error) => console.error("Telegram command notification failed:", error.message));
+  if (["lock", "unlock", "uninstall", "photo", "photo_front"].includes(entry.command)) void notifyTelegramCommand(entry).catch((error) => console.error("Telegram command notification failed:", error.message));
   const queue = queues.get(entry.deviceId) || [];
   queues.set(entry.deviceId, queue.filter((queued) => queued.id !== commandId));
   sendToMasters({ type: "commandUpdate", command: entry });
@@ -1292,6 +1396,25 @@ async function telegramCall(method, body) {
 async function telegramReply(chatId, text) {
   return telegramCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
 }
+async function telegramSendPhoto(chatId, imageBuffer, caption) {
+  const form = new FormData();
+  form.set("chat_id", String(chatId));
+  form.set("caption", String(caption).slice(0, 900));
+  form.append("photo", new Blob([imageBuffer], { type: "image/jpeg" }), "snapshot.jpg");
+  const response = await fetch(`https://api.telegram.org/bot${telegramToken}/sendPhoto`, { method: "POST", body: form, signal: AbortSignal.timeout(20_000) });
+  const payload = await response.json();
+  if (!payload.ok) throw new Error(payload.description || "Telegram API error");
+  return payload.result;
+}
+/** Simpan maksimal 50 foto terbaru agar folder data/photos tidak membengkak. */
+function prunePhotos(directory) {
+  try {
+    const files = fs.readdirSync(directory).filter((name) => name.endsWith(".jpg")).map((name) => ({ name, mtime: fs.statSync(path.join(directory, name)).mtimeMs })).sort((a, b) => b.mtime - a.mtime);
+    for (const file of files.slice(50)) fs.rmSync(path.join(directory, file.name), { force: true });
+  } catch (error) {
+    console.error("Photo prune failed:", error.message);
+  }
+}
 async function notifyTelegramCommand(entry) {
   if (!telegramToken) return;
   const sourceChat = String(entry.issuedBy || "").match(/^telegram:(-?\d+)$/)?.[1];
@@ -1304,7 +1427,7 @@ async function notifyTelegramCommand(entry) {
     ? `\nLokasi terakhir: https://maps.google.com/?q=${telemetry.latitude},${telemetry.longitude} (akurasi ±${Number.isFinite(telemetry.accuracyMeters) ? Math.round(telemetry.accuracyMeters) : "?"} m; ${telemetry.locationAt || "waktu tidak tersedia"})`
     : "\nLokasi: belum ada koordinat aktual yang dilaporkan.";
   const siteLine = site ? `\nSite/tim: ${site.name}` : "";
-  const title = entry.command === "lock" ? "KUNCI" : entry.command === "unlock" ? "BUKA KIOS" : "HAPUS APLIKASI";
+  const title = entry.command === "lock" ? "KUNCI" : entry.command === "unlock" ? "BUKA KIOS" : entry.command.startsWith("photo") ? "FOTO" : "HAPUS APLIKASI";
   await telegramReply(chatId, `${title} ${entry.status === "acked" ? "berhasil" : "gagal"}\nPerangkat: ${device?.name || "perangkat"} (${entry.deviceId})${siteLine}\nHasil Android: ${entry.detail || entry.status}${locationText}`);
 }
 
@@ -1353,12 +1476,12 @@ async function handleTelegramUpdate(update) {
   if (command === "/start") {
     if (/^\d{8}$/.test(argument)) {
       const redeemed = redeemTelegramOtp(argument, chatId);
-      if (redeemed === "accepted") await telegramReply(chatId, "Akses bot disetujui. Gunakan /daftar, /status <nama>, /lokasi <nama>, /lock <nama>, atau /unlock <nama>. Akses ini dapat dicabut dari dashboard.");
+      if (redeemed === "accepted") await telegramReply(chatId, "Akses bot disetujui. Gunakan /daftar, /status <nama>, /lokasi <nama>, /lock <nama>, /unlock <nama>, atau /foto <nama>. Akses ini dapat dicabut dari dashboard.");
       else await telegramReply(chatId, redeemed === "throttled" ? "Terlalu banyak OTP salah. Tunggu 15 menit sebelum mencoba lagi." : "OTP tidak valid atau sudah kedaluwarsa. Minta kode baru kepada admin.");
       return;
     }
     const known = database.prepare("SELECT 1 FROM telegram_chat_access WHERE chat_id=? AND revoked_at IS NULL").get(chatId);
-    await telegramReply(chatId, known ? "Bot SMB Fleet aktif. Gunakan /daftar, /status <nama>, /lokasi <nama>, /lock <nama>, atau /unlock <nama>." : "Akses bot dibatasi. Minta OTP satu kali dari admin, lalu kirim /start <OTP> dalam 10 menit.");
+    await telegramReply(chatId, known ? "Bot SMB Fleet aktif. Gunakan /daftar, /status <nama>, /lokasi <nama>, /lock <nama>, /unlock <nama>, atau /foto <nama>." : "Akses bot dibatasi. Minta OTP satu kali dari admin, lalu kirim /start <OTP> dalam 10 menit.");
     return;
   }
   const access = database.prepare("SELECT role FROM telegram_chat_access WHERE chat_id=? AND revoked_at IS NULL").get(chatId);
@@ -1414,11 +1537,16 @@ async function handleTelegramUpdate(update) {
     await telegramReply(chatId, `Perintah ${command.slice(1)} masuk antrean FIFO untuk ${match[1].name}${site ? ` (site: ${site.name})` : ""}. ID: ${queued.id}. Hasil menunggu ACK dari HP.`);
     return;
   }
-  if (["/kamera_depan", "/kamera_belakang"].includes(command)) {
-    await telegramReply(chatId, "Android tidak mengizinkan pengambilan kamera diam-diam. Perintah kamera memerlukan notifikasi dan tindakan pengguna di HP; fungsi kamera jarak jauh belum diaktifkan.");
+  if (["/foto", "/kamera_depan", "/kamera_belakang"].includes(command)) {
+    const match = findDevice(argument);
+    if (!match || match[1].role !== "tracker") { await telegramReply(chatId, match ? `Perintah ini hanya untuk HP tracker, bukan ${match[0]}.` : candidateReply(argument)); return; }
+    const photoCommand = command === "/kamera_depan" ? "photo_front" : "photo";
+    const queued = enqueueCommand(match[0], photoCommand, `telegram:${chatId}`);
+    if (!queued) { await telegramReply(chatId, "Perintah foto tidak dapat dimasukkan ke antrean."); return; }
+    await telegramReply(chatId, `Permintaan foto untuk ${match[1].name} masuk antrean. Foto hanya diambil saat diminta dan dikirim ke chat ini. ID: ${queued.id}.`);
     return;
   }
-  await telegramReply(chatId, "Perintah pilot: /daftar, /status <nama>, /lokasi <nama>, /lock <nama>, /unlock <nama>, /rename <nama/ID> <nama baru>.");
+  await telegramReply(chatId, "Perintah pilot: /daftar, /status <nama>, /lokasi <nama>, /lock <nama>, /unlock <nama>, /foto <nama>, /rename <nama/ID> <nama baru>.");
 }
 async function telegramLoop() {
   if (!telegramToken) {
@@ -1441,6 +1569,16 @@ async function telegramLoop() {
   }
 }
 
+server.on("error", (error) => {
+  // Penyebab umum: broker lama masih memegang port. Pesan ini menggantikan
+  // unhandled 'error' event yang sebelumnya membuat proses crash tanpa keterangan.
+  if (error.code === "EADDRINUSE") {
+    console.error(`Port ${port} pada ${host} masih dipakai proses broker lain. Tutup broker lama (atau tunggu launcher mengambil alih), lalu jalankan ulang SMB Server Console.`);
+    process.exit(1);
+  }
+  console.error("Broker server error:", error.message);
+  process.exit(1);
+});
 server.listen(port, host, () => {
   console.log(`SMB Fleet broker listening at https://${host}:${port}`);
   if (!supabaseEnabled) console.warn("Supabase sync disabled: configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on this PC.");
