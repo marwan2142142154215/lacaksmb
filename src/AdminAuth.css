@@ -1,0 +1,217 @@
+.smb-gate {
+  --auth-ink: #172a30;
+  --auth-muted: #849297;
+  --auth-line: #e8edec;
+  --auth-green: #168767;
+  --auth-green-dark: #116f55;
+  --auth-green-soft: #eaf6f1;
+  display: flex;
+  min-height: 100vh;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: radial-gradient(circle at 20% 0%, #eef4f3 0%, #f6f8f8 55%, #eef2f2 100%);
+}
+.smb-gate-card {
+  width: 100%;
+  max-width: 400px;
+  padding: 26px;
+  border: 1px solid var(--auth-line);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 10px 30px rgba(22, 47, 53, 0.08);
+  color: var(--auth-ink);
+}
+.smb-gate-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  margin-bottom: 14px;
+  place-items: center;
+  border-radius: 12px;
+  color: var(--auth-green-dark);
+  background: var(--auth-green-soft);
+}
+.smb-gate-card h1 {
+  margin: 0 0 6px;
+  font-family: "Manrope", sans-serif;
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--auth-ink);
+}
+.smb-gate-card p {
+  margin: 0 0 18px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--auth-muted);
+}
+.smb-gate-card code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--auth-green-dark);
+  background: var(--auth-green-soft);
+}
+.smb-gate-card label {
+  display: block;
+  margin: 0 0 6px;
+  color: var(--auth-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.smb-gate-card input {
+  width: 100%;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--auth-line);
+  border-radius: 10px;
+  outline: none;
+  color: var(--auth-ink);
+  background: #fbfcfc;
+  font-size: 13px;
+}
+.smb-gate-card input:focus {
+  border-color: var(--auth-green);
+  box-shadow: 0 0 0 3px var(--auth-green-soft);
+}
+.smb-gate-card button {
+  width: 100%;
+  margin-top: 14px;
+  padding: 11px 14px;
+  border: 0;
+  border-radius: 10px;
+  color: #fff;
+  background: var(--auth-green);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.smb-gate-card button:hover { background: var(--auth-green-dark); }
+.smb-gate-card button:disabled { cursor: wait; opacity: 0.65; }
+.smb-gate-card .smb-gate-secondary {
+  margin-top: 8px;
+  border: 1px solid var(--auth-line);
+  color: var(--auth-ink);
+  background: #fff;
+}
+.smb-gate-error {
+  display: block;
+  margin-top: 8px;
+  color: #b4441f;
+  font-size: 11px;
+  font-weight: 600;
+}
+.smb-gate-foot {
+  display: block;
+  margin-top: 14px;
+  color: var(--auth-muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+.smb-auth-step { margin: 0 0 14px !important; }
+.smb-totp-secret {
+  display: block;
+  overflow-wrap: anywhere;
+  margin: 0 0 16px;
+  padding: 13px 14px;
+  border: 1px solid var(--auth-line);
+  border-radius: 10px;
+  color: var(--auth-green-dark);
+  background: var(--auth-green-soft);
+  font-size: 14px !important;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+.smb-auth-loading {
+  display: grid;
+  min-height: 100vh;
+  place-content: center;
+  justify-items: center;
+  gap: 12px;
+  color: #849297;
+  font-size: 13px;
+}
+.smb-top-actions { gap: 12px; }
+.smb-admin-name { color: var(--sc-muted); font-size: 12px; font-weight: 700; }
+.smb-logout-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--sc-line);
+  border-radius: 9px;
+  color: var(--sc-ink);
+  background: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+.smb-logout-button:hover { border-color: var(--sc-green); color: var(--sc-green-dark); }
+.smb-admin-users-page { display: grid; gap: 18px; }
+.smb-password-panel { margin-top: 18px; }
+.smb-admin-help { margin: 0 0 18px; color: var(--sc-muted); font-size: 12px; line-height: 1.6; }
+.smb-admin-create-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  align-items: end;
+}
+.smb-admin-create-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--sc-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.smb-admin-create-form input,
+.smb-admin-create-form select {
+  width: 100%;
+  min-height: 40px;
+  padding: 9px 11px;
+  border: 1px solid var(--sc-line);
+  border-radius: 9px;
+  color: var(--sc-ink);
+  background: #fff;
+  font-size: 12px;
+  text-transform: none;
+}
+.smb-admin-create-form label small { font-size: 10px; font-weight: 500; letter-spacing: normal; text-transform: none; }
+.smb-admin-create-form button { min-height: 40px; }
+.smb-admin-create-form button:disabled { cursor: wait; opacity: 0.65; }
+.smb-admin-list { display: grid; }
+.smb-admin-row {
+  display: flex;
+  min-height: 66px;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--sc-line);
+}
+.smb-admin-avatar {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--sc-green-dark);
+  background: var(--sc-green-light);
+}
+.smb-admin-account { display: grid; flex: 1; gap: 4px; }
+.smb-admin-account strong { color: var(--sc-ink); font-size: 12px; }
+.smb-admin-account small { color: var(--sc-muted); font-size: 10px; }
+.smb-reset-totp { min-height: 32px; padding: 6px 9px; font-size: 10px; }
+.smb-admin-feedback { margin-top: 12px; padding: 10px 12px; border-radius: 9px; font-size: 11px; line-height: 1.5; }
+.smb-admin-feedback.is-success { color: #17654d; background: #e9f6f0; }
+.smb-admin-feedback.is-error { color: #a33b25; background: #fff1eb; }
+@media (max-width: 740px) {
+  .smb-admin-create-form { grid-template-columns: 1fr; }
+  .smb-admin-row { flex-wrap: wrap; padding: 10px 0; }
+  .smb-admin-account { min-width: calc(100% - 52px); }
+  .smb-logout-button { padding: 8px; font-size: 0; }
+  .smb-logout-button svg { margin: 0; }
+}

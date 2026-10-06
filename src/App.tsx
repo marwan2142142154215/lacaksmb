@@ -2,17 +2,18 @@ import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "re
 import {
   Activity, AlertTriangle, ArrowUpRight, Battery, Bluetooth, Bot, Check, ChevronRight,
   CircleAlert, Clock3, Command, EyeOff, LayoutDashboard, ListChecks, LockKeyhole,
-  MapPin, MapPinOff, Menu, Network, Pencil, PlugZap, Radio, RefreshCw, Search, Server,
-  Settings2, ShieldCheck, Smartphone, UnlockKeyhole, Wifi, X,
+  LogOut, MapPin, MapPinOff, Menu, Network, Pencil, PlugZap, Radio, RefreshCw, Search, Server,
+  Settings2, ShieldCheck, Smartphone, UnlockKeyhole, Users, Wifi, X,
 } from "lucide-react";
 import TrackerPage from "./TrackerPage";
-import { brokerConfig, clearAdminToken, proximityBle, readAdminToken, saveAdminToken } from "./proximityBle";
+import { brokerConfig, clearAdminToken, proximityBle, readAdminIdentity, readAdminToken, saveAdminSession, type AdminIdentity } from "./proximityBle";
 import { usePilotBroker, type PilotTelemetry } from "./pilotBroker";
 import "./MasterConsole.css";
+import "./AdminAuth.css";
 
 const MASTER_ID = "R9RY506354P";
 const TRACKER_ID = "R9RXC03EC9N";
-type Page = "overview" | "devices" | "commands" | "proximity" | "policy" | "integrations" | "settings";
+type Page = "overview" | "devices" | "commands" | "proximity" | "policy" | "integrations" | "settings" | "admins";
 type CommandRow = { id: string; deviceId: string; command: string; issuedBy: string; status: string; createdAt: string; completedAt?: string; detail?: string };
 type Device = { deviceId: string; name: string; role?: string; online: boolean; lastSeenAt?: string | null; telemetry?: PilotTelemetry | null };
 type SignalSample = { minuteAt: string; sampleCount: number; detectedCount: number; rssiAvg: number | null; rssiMin: number | null; rssiMax: number | null; batteryLevel: number | null };
@@ -26,6 +27,7 @@ const navigation: Array<{ id: Page; title: string; icon: typeof LayoutDashboard;
   { id: "proximity", title: "Kedekatan BLE", icon: Bluetooth, group: "KONTROL" },
   { id: "policy", title: "Kebijakan Android", icon: ShieldCheck },
   { id: "integrations", title: "Integrasi", icon: PlugZap, group: "SISTEM" },
+  { id: "admins", title: "Akun admin", icon: Users, group: "SISTEM" },
   { id: "settings", title: "Pengaturan", icon: Settings2 },
 ];
 const pageTitles: Record<Page, { title: string; description: string }> = {
@@ -36,6 +38,7 @@ const pageTitles: Record<Page, { title: string; description: string }> = {
   policy: { title: "Kebijakan Android", description: "Status Device Owner dan batasan lock task yang dilaporkan tracker." },
   integrations: { title: "Integrasi", description: "Koneksi yang benar-benar dikonfigurasi oleh broker saat ini." },
   settings: { title: "Pengaturan sistem", description: "Identitas master, broker, penyimpanan, dan kemampuan yang aktif." },
+  admins: { title: "Akun admin", description: "Kelola akses staf dengan password unik dan 2FA authenticator." },
 };
 
 function App() {
@@ -62,51 +65,115 @@ function useAdminToken() {
 
 function MasterConsoleGate() {
   const token = useAdminToken();
-  if (!token) return <AdminGate />;
-  return <MasterConsole token={token} />;
+  const [user, setUser] = useState<AdminIdentity | null>(readAdminIdentity);
+  const [checking, setChecking] = useState(Boolean(token));
+  const apiBase = brokerConfig.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:").replace(/\/ws(?:\?.*)?$/, "");
+  useEffect(() => {
+    let active = true;
+    if (!token) { setUser(null); setChecking(false); return; }
+    setChecking(true);
+    void fetch(`${apiBase}/api/auth/me`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Session expired");
+        return response.json() as Promise<{ user: AdminIdentity }>;
+      })
+      .then((data) => { if (active) { setUser(data.user); setChecking(false); } })
+      .catch(() => { if (active) { clearAdminToken(); setUser(null); setChecking(false); } });
+    return () => { active = false; };
+  }, [apiBase, token]);
+  if (!token) return <AdminGate apiBase={apiBase} />;
+  if (checking) return <div className="smb-auth-loading"><ShieldCheck size={20} /> Memeriksa sesi admin…</div>;
+  if (!user) return <AdminGate apiBase={apiBase} />;
+  return <MasterConsole token={token} adminUser={user} apiBase={apiBase} />;
 }
 
-function AdminGate() {
-  const [value, setValue] = useState("");
+function AdminGate({ apiBase }: { apiBase: string }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [totpCode, setTotpCode] = useState("");
+  const [stage, setStage] = useState<"credentials" | "verify_totp" | "enroll_totp">("credentials");
+  const [setupToken, setSetupToken] = useState("");
+  const [setupSecret, setSetupSecret] = useState("");
   const [error, setError] = useState("");
-  const submit = (event: FormEvent) => {
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!value.trim()) { setError("Token admin wajib diisi."); return; }
-    saveAdminToken(value);
-    setValue("");
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      if (stage === "enroll_totp") {
+        const response = await fetch(`${apiBase}/api/auth/totp/confirm`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ setupToken, totpCode }), cache: "no-store",
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.message || "Kode authenticator tidak diterima.");
+        finishLogin(result);
+        return;
+      }
+      const response = await fetch(`${apiBase}/api/auth/login`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username, password, ...(stage === "verify_totp" ? { totpCode } : {}) }), cache: "no-store",
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message || "Login gagal.");
+      if (result.stage === "verify_totp") { setStage("verify_totp"); setTotpCode(""); return; }
+      if (result.stage === "enroll_totp") {
+        setSetupToken(result.setupToken);
+        setSetupSecret(result.secret);
+        setStage("enroll_totp");
+        setTotpCode("");
+        return;
+      }
+      finishLogin(result);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Tidak dapat menghubungi broker.");
+    } finally { setBusy(false); }
+  };
+  const finishLogin = (result: { sessionToken?: string; user?: AdminIdentity }) => {
+    if (!result.sessionToken || !result.user) { setError("Server tidak mengirim sesi login yang valid."); return; }
+    saveAdminSession(result.sessionToken, result.user);
+    setPassword("");
+    setTotpCode("");
     setError("");
   };
+  const resetLogin = () => { setStage("credentials"); setTotpCode(""); setError(""); };
   return (
     <div className="smb-gate">
       <form className="smb-gate-card" onSubmit={submit}>
         <div className="smb-gate-icon"><ShieldCheck size={22} /></div>
         <h1>Masuk konsol SMB</h1>
-        <p>
-          Token admin broker disimpan di <code>sessionStorage</code> tab ini saja,
-          bukan di dalam bundle. Kalau token ditolak, hapus cookie dan muat ulang.
-        </p>
-        <label htmlFor="smb-admin-token">Token admin</label>
-        <input
-          id="smb-admin-token"
-          type="password"
-          autoComplete="off"
-          spellCheck={false}
-          value={value}
-          onChange={(event) => { setValue(event.target.value); setError(""); }}
-          placeholder="FLEET_MASTER_TOKEN"
-        />
+        <p>Login dashboard dilindungi password dan kode 2FA dari aplikasi authenticator.</p>
+        {stage === "credentials" && <>
+          <label htmlFor="smb-admin-username">Username</label>
+          <input id="smb-admin-username" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required />
+          <label htmlFor="smb-admin-password">Password</label>
+          <input id="smb-admin-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
+        </>}
+        {stage === "verify_totp" && <>
+          <p className="smb-auth-step">Masukkan kode 6 digit dari authenticator untuk <strong>{username}</strong>.</p>
+          <label htmlFor="smb-admin-code">Kode 2FA</label>
+          <input id="smb-admin-code" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={totpCode} onChange={(event) => setTotpCode(event.target.value.replace(/\D/g, "").slice(0, 6))} required />
+          <button className="smb-gate-secondary" type="button" onClick={resetLogin}>Kembali</button>
+        </>}
+        {stage === "enroll_totp" && <>
+          <p className="smb-auth-step">Tambahkan akun <strong>SMB Fleet</strong> di Google Authenticator, Microsoft Authenticator, atau aplikasi TOTP lain menggunakan kunci ini. Simpan sebelum lanjut.</p>
+          <code className="smb-totp-secret">{setupSecret}</code>
+          <label htmlFor="smb-enroll-code">Kode 6 digit authenticator</label>
+          <input id="smb-enroll-code" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={totpCode} onChange={(event) => setTotpCode(event.target.value.replace(/\D/g, "").slice(0, 6))} required />
+        </>}
         {error && <small className="smb-gate-error">{error}</small>}
-        <button type="submit">Buka konsol</button>
+        <button type="submit" disabled={busy}>{busy ? "Memverifikasi…" : stage === "enroll_totp" ? "Aktifkan 2FA dan masuk" : stage === "verify_totp" ? "Verifikasi 2FA" : "Masuk"}</button>
         <small className="smb-gate-foot">
-          Akses publik dilindungi Cloudflare Access. Jangan pernah menempelkan token
-          ini ke dalam kode atau repository.
+          Sesi aktif disimpan sementara pada tab ini dan berakhir otomatis. Jangan bagikan kode authenticator.
         </small>
       </form>
     </div>
   );
 }
 
-function MasterConsole({ token }: { token: string }) {
+function MasterConsole({ token, adminUser, apiBase }: { token: string; adminUser: AdminIdentity; apiBase: string }) {
   const broker = usePilotBroker("master", MASTER_ID, undefined, token);
   const [page, setPage] = useState<Page>("overview");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -122,7 +189,6 @@ function MasterConsole({ token }: { token: string }) {
   const [beaconMessage, setBeaconMessage] = useState("Beacon master belum dinyalakan.");
   const [loading, setLoading] = useState(true);
   const [refreshAt, setRefreshAt] = useState<string | null>(null);
-  const apiBase = brokerConfig.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:").replace(/\/ws(?:\?.*)?$/, "");
   const trackerTelemetry = snapshot?.telemetry || broker.telemetry;
 
   useEffect(() => {
@@ -221,6 +287,10 @@ function MasterConsole({ token }: { token: string }) {
   const openDevice = (device: Device) => { setSelectedId(device.deviceId); setPage("devices"); };
   const currentTitle = pageTitles[page];
   const lastUpdate = telemetry?.receivedAt ? formatTime(telemetry.receivedAt) : "Belum ada laporan";
+  const logout = () => {
+    void fetch(`${apiBase}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(() => undefined);
+    clearAdminToken();
+  };
 
   return (
     <div className="smb-console">
@@ -228,14 +298,14 @@ function MasterConsole({ token }: { token: string }) {
         <div className="smb-brand"><div className="smb-brand-mark"><Radio size={21} /></div><div><strong>SMB <span>Master</span></strong><small>FLEET CONTROL</small></div><button className="smb-close-sidebar" onClick={() => setSidebarOpen(false)} aria-label="Tutup menu"><X size={18} /></button></div>
         <div className="smb-master-card"><div className="smb-avatar">SM</div><div><strong>Master utama</strong><span>ID {MASTER_ID}</span></div><span className={`smb-presence ${broker.connected ? "is-online" : ""}`} title={broker.connected ? "Tersambung" : "Terputus"} /></div>
         <nav className="smb-navigation" aria-label="Navigasi utama">
-          {navigation.map((item, index) => <div key={item.id}>{item.group && <div className={`smb-nav-group ${index > 0 ? "smb-nav-group-spaced" : ""}`}>{item.group}</div>}<button className={`smb-nav-link ${page === item.id ? "is-active" : ""}`} onClick={() => go(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.title}</span>{item.id === "commands" && commands.filter((row) => row.status === "pending" || row.status === "sent").length > 0 && <b>{commands.filter((row) => row.status === "pending" || row.status === "sent").length}</b>}</button></div>)}
+          {navigation.filter((item) => item.id !== "admins" || adminUser.role === "superadmin").map((item, index) => <div key={item.id}>{item.group && <div className={`smb-nav-group ${index > 0 ? "smb-nav-group-spaced" : ""}`}>{item.group}</div>}<button className={`smb-nav-link ${page === item.id ? "is-active" : ""}`} onClick={() => go(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.title}</span>{item.id === "commands" && commands.filter((row) => row.status === "pending" || row.status === "sent").length > 0 && <b>{commands.filter((row) => row.status === "pending" || row.status === "sent").length}</b>}</button></div>)}
         </nav>
         <div className="smb-sidebar-bottom"><div className="smb-broker-indicator"><span className={`smb-live-dot ${broker.connected ? "" : "is-off"}`} /><div><strong>Broker PC</strong><small>{broker.connected ? "Terhubung via WSS TLS" : "Tidak terhubung"}</small></div><Wifi size={16} /></div><div className="smb-sidebar-foot">SMB FLEET · LOCAL BROKER</div></div>
       </aside>
       {sidebarOpen && <button className="smb-sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="Tutup menu" />}
 
       <main className="smb-main">
-        <header className="smb-topbar"><button className="smb-menu-button" aria-label="Buka menu" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button><div className="smb-breadcrumb">SMB Control <ChevronRight size={14} /><span>{currentTitle.title}</span></div><div className="smb-top-actions"><div className={`smb-connection-chip ${broker.connected ? "is-connected" : ""}`}><i />{broker.connected ? "Broker tersambung" : "Broker terputus"}</div><span className="smb-top-divider" /><button className="smb-icon-button" title="Perbarui data" onClick={() => window.location.reload()}><RefreshCw size={17} /></button><div className="smb-top-avatar">SM</div></div></header>
+        <header className="smb-topbar"><button className="smb-menu-button" aria-label="Buka menu" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button><div className="smb-breadcrumb">SMB Control <ChevronRight size={14} /><span>{currentTitle.title}</span></div><div className="smb-top-actions"><div className={`smb-connection-chip ${broker.connected ? "is-connected" : ""}`}><i />{broker.connected ? "Broker tersambung" : "Broker terputus"}</div><span className="smb-top-divider" /><span className="smb-admin-name">{adminUser.username}</span><button className="smb-logout-button" onClick={logout}><LogOut size={15} />Keluar</button><button className="smb-icon-button" title="Perbarui data" onClick={() => window.location.reload()}><RefreshCw size={17} /></button></div></header>
 
         <div className="smb-content">
           <div className="smb-page-heading"><div><p className="smb-eyebrow">FLEET MANAGEMENT</p><h1>{currentTitle.title}</h1><p className="smb-page-description">{currentTitle.description}</p></div><div className="smb-heading-meta"><span className="smb-local-badge"><Server size={14} /> Server lokal</span><small>{refreshAt ? `Diperbarui ${formatTime(refreshAt)}` : loading ? "Menghubungkan..." : "Belum tersinkron"}</small></div></div>
@@ -247,7 +317,8 @@ function MasterConsole({ token }: { token: string }) {
           {page === "proximity" && <ProximityPage telemetry={trackerTelemetry} devices={devices} />}
           {page === "policy" && <PolicyPage telemetry={trackerTelemetry} />}
           {page === "integrations" && <IntegrationsPage brokerConnected={broker.connected} telegramConfigured={snapshot?.telegram.configured || false} supabaseConfigured={snapshot?.supabase.configured || false} />}
-          {page === "settings" && <SettingsPage devices={devices} telemetry={trackerTelemetry} brokerConnected={broker.connected} telegramConfigured={snapshot?.telegram.configured || false} />}
+          {page === "settings" && <><SettingsPage devices={devices} telemetry={trackerTelemetry} brokerConnected={broker.connected} telegramConfigured={snapshot?.telegram.configured || false} /><ChangePasswordPanel apiBase={apiBase} token={token} /></>}
+          {page === "admins" && adminUser.role === "superadmin" && <AdminUsersPage apiBase={apiBase} token={token} />}
           <footer className="smb-page-footer"><span>SMB Master · {MASTER_ID}</span><span>Data berasal dari broker lokal · {lastUpdate}</span></footer>
         </div>
       </main>
@@ -351,6 +422,126 @@ function IntegrationsPage({ brokerConnected, telegramConfigured, supabaseConfigu
 
 function SettingsPage({ devices, telemetry, brokerConnected, telegramConfigured }: { devices: Device[]; telemetry: Snapshot["telemetry"] | null | undefined; brokerConnected: boolean; telegramConfigured: boolean }) {
   return <><div className="smb-settings-grid"><section className="smb-panel"><PanelHeading kicker="IDENTITAS" title="Perangkat master" /><div className="smb-setting-row"><div className="smb-setting-icon"><Smartphone size={18} /></div><div><strong>SMB Master</strong><small>ID perangkat {MASTER_ID}</small></div><span className="smb-tag">MASTER</span></div></section><section className="smb-panel"><PanelHeading kicker="BROKER" title="Koneksi jaringan" /><div className="smb-setting-row"><div className="smb-setting-icon"><Wifi size={18} /></div><div><strong>WSS terenkripsi</strong><small>Endpoint konfigurasi aplikasi · bukan tunnel internet</small></div><span className={`smb-status-pill ${brokerConnected ? "status-on" : "status-off"}`}>{brokerConnected ? "AKTIF" : "TERPUTUS"}</span></div></section><section className="smb-panel"><PanelHeading kicker="DATA" title="Penyimpanan lokal" /><div className="smb-setting-row"><div className="smb-setting-icon"><Server size={18} /></div><div><strong>SQLite di PC broker</strong><small>{devices.length} baris device aktif dari registri broker</small></div><span className="smb-tag">LOCAL</span></div></section><section className="smb-panel"><PanelHeading kicker="INTEGRASI" title="Fitur tersedia" /><div className="smb-setting-row"><div className="smb-setting-icon"><Bot size={18} /></div><div><strong>Telegram Bot</strong><small>{telegramConfigured ? "Token ditemukan oleh broker" : "Token belum dikonfigurasi"}</small></div><span className={`smb-status-pill ${telegramConfigured ? "status-on" : "status-off"}`}>{telegramConfigured ? "SIAP" : "NONAKTIF"}</span></div><div className="smb-setting-row"><div className="smb-setting-icon"><Battery size={18} /></div><div><strong>Baterai SMB Lacak</strong><small>Telemetri terakhir yang diterima broker</small></div><span className="smb-tag">{telemetry?.batteryLevel == null ? "—" : `${telemetry.batteryLevel}%`}</span></div><div className="smb-setting-row"><div className="smb-setting-icon"><MapPinOff size={18} /></div><div><strong>Lokasi perangkat aktual</strong><small>{telemetry?.locationAt ? `Terakhir ${formatTime(telemetry.locationAt)}` : "Menunggu laporan GPS"}</small></div><span className="smb-tag">{telemetry?.locationAt ? "LIVE" : "MENUNGGU"}</span></div></section></div><div className="smb-scale-callout"><div className="smb-note-icon"><Activity size={18} /></div><div><strong>Kapasitas armada belum diuji pada skala besar.</strong><p>Server memakai SQLite WAL untuk status dan audit perintah pada instalasi lokal ini. Saat ini dua ID perangkat terdaftar. Provisioning massal, failover, dan uji beban skala ribuan belum disiapkan.</p></div></div></>;
+}
+
+function ChangePasswordPanel({ apiBase, token }: { apiBase: string; token: string }) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [totpCode, setTotpCode] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setMessage("");
+    setError("");
+    try {
+      const response = await fetch(`${apiBase}/api/auth/password`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ currentPassword, newPassword, totpCode }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message || "Password tidak dapat diperbarui.");
+      setMessage(result.message);
+      setCurrentPassword("");
+      setNewPassword("");
+      setTotpCode("");
+    } catch (submitError) { setError(submitError instanceof Error ? submitError.message : "Permintaan gagal."); }
+    finally { setBusy(false); }
+  };
+  return <section className="smb-panel smb-password-panel">
+    <PanelHeading kicker="KEAMANAN AKUN" title="Ganti password" />
+    <p className="smb-admin-help">Gunakan password berbeda dan panjang. Perubahan memerlukan password serta kode 2FA saat ini.</p>
+    <form className="smb-admin-create-form" onSubmit={submit}>
+      <label>Password saat ini<input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
+      <label>Password baru<input type="password" autoComplete="new-password" minLength={12} maxLength={256} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /><small>Minimal 12 karakter.</small></label>
+      <label>Kode 2FA<input inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={totpCode} onChange={(event) => setTotpCode(event.target.value.replace(/\D/g, "").slice(0, 6))} required /></label>
+      <button className="smb-button-primary" type="submit" disabled={busy}>{busy ? "Menyimpan…" : "Perbarui password"}</button>
+    </form>
+    {message && <div className="smb-admin-feedback is-success">{message}</div>}
+    {error && <div className="smb-admin-feedback is-error">{error}</div>}
+  </section>;
+}
+
+type AdminAccount = { id: number; username: string; role: "superadmin" | "staff"; totpEnabled: boolean; createdAt: string };
+
+function AdminUsersPage({ apiBase, token }: { apiBase: string; token: string }) {
+  const [users, setUsers] = useState<AdminAccount[]>([]);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState<"staff" | "superadmin">("staff");
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const headers = { Authorization: `Bearer ${token}`, "content-type": "application/json" };
+  const loadUsers = async () => {
+    try {
+      const response = await fetch(`${apiBase}/api/admin/users`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "Daftar akun tidak dapat dimuat.");
+      setUsers(data.users as AdminAccount[]);
+      setError("");
+    } catch (loadError) { setError(loadError instanceof Error ? loadError.message : "Koneksi broker gagal."); }
+  };
+  useEffect(() => { void loadUsers(); }, [apiBase, token]);
+  const createUser = async (event: FormEvent) => {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setNotice("");
+    setError("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/users`, { method: "POST", headers, body: JSON.stringify({ username, password, role }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "Akun tidak dapat dibuat.");
+      setNotice(`Akun ${data.user.username} dibuat. Minta pengguna mendaftarkan aplikasi authenticator saat login pertama.`);
+      setUsername("");
+      setPassword("");
+      await loadUsers();
+    } catch (createError) { setError(createError instanceof Error ? createError.message : "Pembuatan akun gagal."); }
+    finally { setBusy(false); }
+  };
+  const resetTotp = async (user: AdminAccount) => {
+    if (!window.confirm(`Reset 2FA untuk ${user.username}? Sesi mereka akan dicabut dan mereka perlu menyiapkan authenticator lagi.`)) return;
+    setError("");
+    setNotice("");
+    try {
+      const response = await fetch(`${apiBase}/api/admin/users/${user.id}/reset-totp`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "Reset 2FA gagal.");
+      setNotice(data.message);
+      await loadUsers();
+    } catch (resetError) { setError(resetError instanceof Error ? resetError.message : "Reset 2FA gagal."); }
+  };
+  return <div className="smb-admin-users-page">
+    <section className="smb-panel smb-admin-create-panel">
+      <PanelHeading kicker="AKSES DASHBOARD" title="Tambah akun admin" />
+      <p className="smb-admin-help">Password hanya disimpan sebagai hash. Pengguna baru wajib mendaftarkan 2FA authenticator sebelum dapat masuk.</p>
+      <form className="smb-admin-create-form" onSubmit={createUser}>
+        <label>Username<input autoComplete="off" value={username} onChange={(event) => setUsername(event.target.value)} minLength={3} maxLength={32} pattern="[A-Za-z0-9._-]+" required /></label>
+        <label>Password sementara<input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={12} maxLength={256} required /><small>Minimal 12 karakter.</small></label>
+        <label>Peran<select value={role} onChange={(event) => setRole(event.target.value as "staff" | "superadmin")}><option value="staff">Staff</option><option value="superadmin">Superadmin</option></select></label>
+        <button className="smb-button-primary" type="submit" disabled={busy}>{busy ? "Membuat akun…" : "Buat akun"}</button>
+      </form>
+      {notice && <div className="smb-admin-feedback is-success">{notice}</div>}
+      {error && <div className="smb-admin-feedback is-error">{error}</div>}
+    </section>
+    <section className="smb-panel smb-admin-list-panel">
+      <PanelHeading kicker="PENGGUNA TERDAFTAR" title={`${users.length} akun`} action={<button className="smb-text-link" onClick={() => void loadUsers()}><RefreshCw size={14} /> Segarkan</button>} />
+      <div className="smb-admin-list">
+        {users.map((user) => <div className="smb-admin-row" key={user.id}>
+          <div className="smb-admin-avatar"><Users size={17} /></div>
+          <div className="smb-admin-account"><strong>{user.username}</strong><small>{user.role === "superadmin" ? "Superadmin" : "Staff"} · dibuat {formatTime(user.createdAt)}</small></div>
+          <span className={`smb-status-pill ${user.totpEnabled ? "status-on" : "status-off"}`}>{user.totpEnabled ? "2FA AKTIF" : "2FA WAJIB"}</span>
+          {user.totpEnabled && <button className="smb-button-muted smb-reset-totp" onClick={() => void resetTotp(user)}>Reset 2FA</button>}
+        </div>)}
+        {users.length === 0 && <EmptyState icon={<Users size={21} />} title="Belum ada akun" body="Daftar pengguna akan muncul setelah dimuat dari broker." />}
+      </div>
+    </section>
+  </div>;
 }
 
 function MetricCard({ icon, label, value, foot, tone }: { icon: ReactNode; label: string; value: string; foot: string; tone: string }) {

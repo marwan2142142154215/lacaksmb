@@ -73,11 +73,26 @@ export const brokerConfig = {
 // devtools. The dashboard therefore takes its token at runtime from
 // sessionStorage, so it leaves no trace in the bundle or source maps.
 const ADMIN_TOKEN_KEY = "smb.admin.token";
+const ADMIN_USER_KEY = "smb.admin.user";
 const ADMIN_TOKEN_EVENT = "smb:admin-token";
+
+export type AdminIdentity = { id: number; username: string; role: "superadmin" | "staff" };
 
 export function readAdminToken(): string {
   if (typeof window === "undefined") return "";
   try { return window.sessionStorage.getItem(ADMIN_TOKEN_KEY) || ""; } catch { return ""; }
+}
+
+export function readAdminIdentity(): AdminIdentity | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(ADMIN_USER_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as AdminIdentity;
+    return Number.isInteger(value.id) && typeof value.username === "string" && ["superadmin", "staff"].includes(value.role)
+      ? value
+      : null;
+  } catch { return null; }
 }
 
 function writeAdminToken(value: string) {
@@ -93,10 +108,15 @@ function writeAdminToken(value: string) {
   window.dispatchEvent(new Event(ADMIN_TOKEN_EVENT));
 }
 
-export function saveAdminToken(value: string) {
-  writeAdminToken(value);
+export function saveAdminSession(token: string, user: AdminIdentity) {
+  if (typeof window === "undefined") return;
+  try { window.sessionStorage.setItem(ADMIN_USER_KEY, JSON.stringify(user)); } catch { /* The login gate will retry if storage is unavailable. */ }
+  writeAdminToken(token);
 }
 
 export function clearAdminToken() {
+  if (typeof window !== "undefined") {
+    try { window.sessionStorage.removeItem(ADMIN_USER_KEY); } catch { /* Continue to clear the token. */ }
+  }
   writeAdminToken("");
 }

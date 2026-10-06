@@ -5,6 +5,26 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { DatabaseSync } from "node:sqlite";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import {
+  bootstrapFirstAdmin,
+  completeTotpEnrollment,
+  createAdminUser,
+  createAdminSession,
+  ensureAdminAuthSchema,
+  listAdminUsers,
+  loginIsThrottled,
+  makeTotpEnrollment,
+  publicAdminUser,
+  recordLoginAttempt,
+  resetAdminTotp,
+  resolveAdminSession,
+  revokeAdminSession,
+  tokenDigest,
+  validateUsername,
+  verifyAdminPassword,
+  verifyAdminTotp,
+  updateAdminPassword,
+} from "./adminAuth.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const envFile = path.join(root, ".env.local");
@@ -26,6 +46,7 @@ const supabaseUrl = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const supabaseEnabled = Boolean(supabaseUrl && supabaseServiceKey);
 const locationEncryptionKey = Buffer.from(process.env.FLEET_LOCATION_KEY || "", "base64");
+const adminAuthEncryptionKey = Buffer.from(process.env.FLEET_ADMIN_AUTH_KEY || "", "base64");
 const supabaseDevices = new Map();
 const supabaseStates = new Map();
 const supabaseCommands = new Map();
@@ -38,6 +59,7 @@ const pfxPassphrase = process.env.FLEET_TLS_PASSPHRASE || "";
 
 if (!masterToken || !trackerToken) throw new Error("Set distinct FLEET_MASTER_TOKEN and FLEET_TRACKER_TOKEN in .env.local.");
 if (locationEncryptionKey.length !== 32) throw new Error("Set FLEET_LOCATION_KEY to a random base64-encoded 32-byte key in .env.local.");
+if (adminAuthEncryptionKey.length !== 32) throw new Error("Set FLEET_ADMIN_AUTH_KEY to a random base64-encoded 32-byte key in .env.local.");
 if (!fs.existsSync(pfxPath) || !fs.existsSync(certPath) || !pfxPassphrase) {
   throw new Error("Local WSS certificate is missing. Generate the local broker certificate before starting the broker.");
 }
@@ -80,6 +102,14 @@ database.exec(`
   CREATE INDEX IF NOT EXISTS telemetry_minute_recent ON telemetry_minute(device_id, minute_at DESC);
   CREATE INDEX IF NOT EXISTS location_history_recent ON location_history(device_id, captured_at DESC);
 `);
+ensureAdminAuthSchema(database);
+const bootstrapCreated = bootstrapFirstAdmin(
+  database,
+  process.env.FLEET_BOOTSTRAP_ADMIN_USERNAME || "",
+  process.env.FLEET_BOOTSTRAP_ADMIN_PASSWORD || "",
+);
+delete process.env.FLEET_BOOTSTRAP_ADMIN_PASSWORD;
+if (bootstrapCreated) console.log("Initial superadmin account created; enroll its authenticator during first login.");
 const startupTime = new Date().toISOString();
 for (const [deviceId, device] of devices) {
   database.prepare("INSERT INTO devices (device_id,name,role,created_at,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET name=excluded.name,role=excluded.role,updated_at=excluded.updated_at")
@@ -116,6 +146,54 @@ try {
   if (savedLocation) latestTelemetry = { ...latestTelemetry, ...decryptLocationRow(savedLocation) };
 } catch (error) { console.error(`Saved location could not be decrypted: ${error.message}`); }
 
+function respondJson(response, statusCode, payload) {
+  response.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  });
+  response.end(JSON.stringify(payload));
+}
+
+function bearerToken(request) {
+  const authorization = request.headers.authorization || "";
+  return authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+}
+
+function requireAdminSession(request, response) {
+  const admin = resolveAdminSession(database, bearerToken(request));
+  if (admin) return admin;
+  respondJson(response, 401, { error: "unauthorized", message: "Sesi admin kedaluwarsa. Silakan login lagi." });
+  return null;
+}
+
+async function readJsonRequest(request, maxBytes = 16_384) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      const error = new Error("Request body too large");
+      error.statusCode = 413;
+      error.code = "request_too_large";
+      error.publicMessage = "Ukuran data melebihi batas.";
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Expected object");
+    return body;
+  } catch {
+    const error = new Error("Invalid JSON body");
+    error.statusCode = 400;
+    error.code = "invalid_json";
+    error.publicMessage = "Isi permintaan tidak valid.";
+    throw error;
+  }
+}
+
 const server = https.createServer({
   pfx: fs.readFileSync(pfxPath),
   passphrase: pfxPassphrase,
@@ -143,20 +221,138 @@ const server = https.createServer({
     response.end(JSON.stringify({ ok: true, service: "smb-fleet-broker", devices: publicDevices(false), telemetry: publicTelemetry(latestTelemetry, false), recentCommands }));
     return;
   }
-  if (request.method === "GET" && (request.url === "/api/admin/snapshot" || request.url.startsWith("/api/admin/commands"))) {
-    const auth = request.headers.authorization || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    if (token !== masterToken) {
-      response.writeHead(401, { "content-type": "application/json", "cache-control": "no-store" });
-      response.end(JSON.stringify({ error: "unauthorized" }));
-      return;
+  if (request.method === "POST" && request.url === "/api/auth/login") {
+    void readJsonRequest(request).then((body) => {
+      const username = validateUsername(body.username);
+      if (loginIsThrottled(database, username || body.username)) {
+        respondJson(response, 429, { error: "too_many_attempts", message: "Terlalu banyak percobaan. Coba lagi setelah 15 menit." });
+        return;
+      }
+      const user = username ? database.prepare("SELECT * FROM admin_users WHERE username=?").get(username) : null;
+      if (!verifyAdminPassword(user, body.password)) {
+        recordLoginAttempt(database, username || body.username, false);
+        respondJson(response, 401, { error: "invalid_credentials", message: "Username atau password salah." });
+        return;
+      }
+      if (!user.totp_enabled) {
+        recordLoginAttempt(database, username, true);
+        const enrollment = makeTotpEnrollment(database, user, adminAuthEncryptionKey);
+        respondJson(response, 200, { stage: "enroll_totp", setupToken: enrollment.setupToken, secret: enrollment.secret, otpauthUri: enrollment.otpauthUri, expiresAt: enrollment.expiresAt });
+        return;
+      }
+      if (!body.totpCode) {
+        respondJson(response, 200, { stage: "verify_totp" });
+        return;
+      }
+      if (verifyAdminTotp(database, user, body.totpCode, adminAuthEncryptionKey) === null) {
+        recordLoginAttempt(database, username, false);
+        respondJson(response, 401, { error: "invalid_totp", message: "Kode authenticator salah atau sudah pernah dipakai." });
+        return;
+      }
+      recordLoginAttempt(database, username, true);
+      const session = createAdminSession(database, user.id);
+      respondJson(response, 200, { stage: "authenticated", sessionToken: session.token, expiresAt: session.expiresAt, user: publicAdminUser(user) });
+    }).catch((error) => respondJson(response, error.statusCode || 400, { error: error.code || "invalid_request", message: error.publicMessage || "Permintaan login tidak valid." }));
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/auth/totp/confirm") {
+    void readJsonRequest(request).then((body) => {
+      const setupToken = String(body.setupToken || "");
+      const pendingAdmin = database.prepare(`
+        SELECT u.username FROM admin_totp_pending p
+        JOIN admin_users u ON u.id=p.admin_user_id
+        WHERE p.setup_hash=? AND p.expires_at>?
+      `).get(tokenDigest(setupToken), new Date().toISOString());
+      const attemptKey = pendingAdmin?.username || "totp-enrollment";
+      if (loginIsThrottled(database, attemptKey)) {
+        respondJson(response, 429, { error: "too_many_attempts", message: "Terlalu banyak percobaan. Coba lagi setelah 15 menit." });
+        return;
+      }
+      const result = completeTotpEnrollment(database, setupToken, body.totpCode, adminAuthEncryptionKey);
+      if (!result) {
+        recordLoginAttempt(database, attemptKey, false);
+        respondJson(response, 401, { error: "invalid_totp", message: "Kode salah atau sesi penyiapan 2FA kedaluwarsa. Ulangi login." });
+        return;
+      }
+      recordLoginAttempt(database, result.user.username, true);
+      respondJson(response, 200, { stage: "authenticated", sessionToken: result.session.token, expiresAt: result.session.expiresAt, user: publicAdminUser(result.user) });
+    }).catch((error) => respondJson(response, error.statusCode || 400, { error: error.code || "invalid_request", message: error.publicMessage || "Penyiapan 2FA tidak valid." }));
+    return;
+  }
+  if (request.method === "GET" && request.url === "/api/auth/me") {
+    const admin = resolveAdminSession(database, bearerToken(request));
+    if (!admin) { respondJson(response, 401, { error: "unauthorized" }); return; }
+    respondJson(response, 200, { user: publicAdminUser(admin), expiresAt: admin.expiresAt });
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/auth/logout") {
+    revokeAdminSession(database, bearerToken(request));
+    respondJson(response, 200, { ok: true });
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/auth/password") {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    void readJsonRequest(request).then((body) => {
+      const user = database.prepare("SELECT * FROM admin_users WHERE id=?").get(admin.id);
+      if (!verifyAdminPassword(user, body.currentPassword)
+        || verifyAdminTotp(database, user, body.totpCode, adminAuthEncryptionKey) === null) {
+        respondJson(response, 401, { error: "reauthentication_failed", message: "Password saat ini atau kode 2FA salah." });
+        return;
+      }
+      updateAdminPassword(database, admin.id, body.newPassword);
+      respondJson(response, 200, { ok: true, message: "Password berhasil diperbarui." });
+    }).catch((error) => respondJson(response, error.statusCode || 400, { error: error.code || "invalid_request", message: error.publicMessage || error.message || "Password tidak dapat diperbarui." }));
+    return;
+  }
+  if (request.method === "GET" && request.url === "/api/admin/users") {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden" }); return; }
+    respondJson(response, 200, { users: listAdminUsers(database) });
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/admin/users") {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden" }); return; }
+    void readJsonRequest(request).then((body) => {
+      const created = createAdminUser(database, body.username, body.password, body.role || "staff");
+      respondJson(response, 201, { user: created, message: "Akun dibuat. Pengguna wajib mendaftarkan authenticator saat login pertama." });
+    }).catch((error) => {
+      const duplicate = /UNIQUE constraint failed: admin_users\.username/i.test(error.message || "");
+      respondJson(response, duplicate ? 409 : error.statusCode || 400, {
+        error: duplicate ? "username_taken" : error.code || "invalid_request",
+        message: duplicate ? "Username sudah digunakan." : error.message || "Data admin tidak valid.",
+      });
+    });
+    return;
+  }
+  const resetTotpMatch = request.method === "POST" && request.url.match(/^\/api\/admin\/users\/(\d+)\/reset-totp$/);
+  if (resetTotpMatch) {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
+    if (admin.role !== "superadmin") { respondJson(response, 403, { error: "forbidden" }); return; }
+    const targetUserId = Number(resetTotpMatch[1]);
+    if (targetUserId === admin.id) { respondJson(response, 400, { error: "cannot_reset_self", message: "Gunakan authenticator yang sedang aktif atau minta superadmin lain membantu." }); return; }
+    const user = database.prepare("SELECT id FROM admin_users WHERE id=?").get(targetUserId);
+    if (!user) { respondJson(response, 404, { error: "user_not_found" }); return; }
+    resetAdminTotp(database, targetUserId);
+    for (const client of adminSockets) {
+      if (client.adminSession?.id === targetUserId) client.close(4003, "Admin 2FA was reset");
     }
+    respondJson(response, 200, { ok: true, message: "2FA direset; pengguna harus mendaftarkan authenticator lagi." });
+    return;
+  }
+  if (request.method === "GET" && (request.url === "/api/admin/snapshot" || request.url.startsWith("/api/admin/commands"))) {
+    const admin = requireAdminSession(request, response);
+    if (!admin) return;
     if (request.url === "/api/admin/snapshot") {
       const rows = database.prepare("SELECT * FROM command_log ORDER BY created_at DESC LIMIT 30").all().map(publicCommandRow);
       const signalHistory = database.prepare("SELECT minute_at AS minuteAt,sample_count AS sampleCount,detected_count AS detectedCount,CASE WHEN rssi_count=0 THEN NULL ELSE CAST(rssi_sum AS REAL)/rssi_count END AS rssiAvg,rssi_min AS rssiMin,rssi_max AS rssiMax,battery_level AS batteryLevel FROM telemetry_minute WHERE device_id=? ORDER BY minute_at DESC LIMIT 60").all("R9RXC03EC9N").reverse();
       const locationHistory = database.prepare("SELECT * FROM location_history WHERE device_id=? ORDER BY captured_at DESC LIMIT 100").all("R9RXC03EC9N").map(decryptLocationRow).reverse();
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-      response.end(JSON.stringify({ service: "smb-fleet-broker", generatedAt: new Date().toISOString(), devices: publicDevices(), telemetry: latestTelemetry, locationHistory, signalHistory, commands: rows, telegram: { configured: Boolean(telegramToken), adminChatConfigured: Boolean(telegramAdminChatId) }, supabase: { configured: supabaseEnabled } }));
+      response.end(JSON.stringify({ service: "smb-fleet-broker", generatedAt: new Date().toISOString(), admin: publicAdminUser(admin), devices: publicDevices(), telemetry: latestTelemetry, locationHistory, signalHistory, commands: rows, telegram: { configured: Boolean(telegramToken), adminChatConfigured: Boolean(telegramAdminChatId) }, supabase: { configured: supabaseEnabled } }));
       return;
     }
     const url = new URL(request.url, `https://${request.headers.host || "localhost"}`);
@@ -211,7 +407,7 @@ const server = https.createServer({
         online: true,
       };
       persistTelemetry(latestTelemetry);
-      broadcast({ type: "telemetry", ...latestTelemetry }, "R9RY506354P");
+      sendToMasters({ type: "telemetry", ...latestTelemetry });
       response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store" });
       response.end(JSON.stringify({ accepted: true, receivedAt: latestTelemetry.receivedAt }));
     });
@@ -221,13 +417,18 @@ const server = https.createServer({
   response.end(JSON.stringify({ error: "not_found" }));
 });
 const webSockets = new WebSocketServer({ noServer: true, maxPayload: 4096 });
+const adminSockets = new Set();
 
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url || "/", `https://${request.headers.host || "localhost"}`);
   const deviceId = url.searchParams.get("deviceId") || "";
   const device = devices.get(deviceId);
   const token = url.searchParams.get("token") || "";
-  if (url.pathname !== "/ws" || !device || token !== tokens.get(deviceId)) {
+  const adminSession = device?.role === "master" && token !== masterToken
+    ? resolveAdminSession(database, token)
+    : null;
+  const isAuthorizedDevice = device && token === tokens.get(deviceId);
+  if (url.pathname !== "/ws" || !device || (!isAuthorizedDevice && !adminSession)) {
     socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
@@ -235,18 +436,25 @@ server.on("upgrade", (request, socket, head) => {
   webSockets.handleUpgrade(request, socket, head, (webSocket) => {
     webSocket.deviceId = deviceId;
     webSocket.role = device.role;
+    webSocket.adminSession = adminSession;
     webSockets.emit("connection", webSocket);
   });
 });
 
 webSockets.on("connection", (webSocket) => {
-  sockets.get(webSocket.deviceId)?.close(4001, "Replaced by a newer session");
-  sockets.set(webSocket.deviceId, webSocket);
-  devices.get(webSocket.deviceId).connected = true;
-  persistDeviceConnection(webSocket.deviceId, true);
-  if (webSocket.role === "master") send(webSocket, { type: "telemetry", ...latestTelemetry });
+  if (webSocket.adminSession) {
+    adminSockets.add(webSocket);
+    webSocket.adminSessionExpiresAt = webSocket.adminSession.expiresAt;
+    send(webSocket, { type: "telemetry", ...latestTelemetry });
+  } else {
+    sockets.get(webSocket.deviceId)?.close(4001, "Replaced by a newer session");
+    sockets.set(webSocket.deviceId, webSocket);
+    devices.get(webSocket.deviceId).connected = true;
+    persistDeviceConnection(webSocket.deviceId, true);
+    if (webSocket.role === "master") send(webSocket, { type: "telemetry", ...latestTelemetry });
+  }
   publishDevices();
-  if (webSocket.role === "tracker") drainQueue(webSocket.deviceId);
+  if (webSocket.role === "tracker" && !webSocket.adminSession) drainQueue(webSocket.deviceId);
 
   webSocket.on("message", (rawMessage) => {
     let message;
@@ -264,7 +472,7 @@ webSockets.on("connection", (webSocket) => {
         online: true,
       };
       persistTelemetry(latestTelemetry);
-      broadcast({ type: "telemetry", ...latestTelemetry }, "R9RY506354P");
+      sendToMasters({ type: "telemetry", ...latestTelemetry });
       return;
     }
     if (webSocket.role === "master" && message.type === "commandRequest") {
@@ -272,7 +480,7 @@ webSockets.on("connection", (webSocket) => {
         send(webSocket, { type: "commandResult", ok: false, error: "Target or command is not allowed." });
         return;
       }
-      enqueueCommand(message.targetId, message.command, "master");
+      enqueueCommand(message.targetId, message.command, webSocket.adminSession?.username || "master");
       return;
     }
     if (webSocket.role === "master" && message.type === "renameRequest") {
@@ -295,13 +503,17 @@ webSockets.on("connection", (webSocket) => {
   });
 
   webSocket.on("close", () => {
+    if (webSocket.adminSession) {
+      adminSockets.delete(webSocket);
+      return;
+    }
     if (sockets.get(webSocket.deviceId) !== webSocket) return;
     sockets.delete(webSocket.deviceId);
     devices.get(webSocket.deviceId).connected = false;
     persistDeviceConnection(webSocket.deviceId, false);
     if (webSocket.deviceId === "R9RXC03EC9N") {
       latestTelemetry = { ...latestTelemetry, detected: false, rssi: null, online: false, receivedAt: new Date().toISOString() };
-      broadcast({ type: "telemetry", ...latestTelemetry }, "R9RY506354P");
+      sendToMasters({ type: "telemetry", ...latestTelemetry });
     }
     publishDevices();
   });
@@ -311,6 +523,10 @@ function send(webSocket, packet) {
   if (webSocket?.readyState === WebSocket.OPEN) webSocket.send(JSON.stringify(packet));
 }
 function broadcast(packet, deviceId) { send(sockets.get(deviceId), packet); }
+function sendToMasters(packet) {
+  send(sockets.get("R9RY506354P"), packet);
+  for (const client of adminSockets) send(client, packet);
+}
 function publicDevices(includeLocation = true) {
   const stateById = new Map(database.prepare("SELECT device_id,last_seen_at,telemetry_json FROM device_state").all().map((state) => [state.device_id, state]));
   return [...devices.entries()].map(([deviceId, device]) => {
@@ -325,7 +541,7 @@ function publicTelemetry(telemetry, includeLocation = true) {
   const { latitude, longitude, accuracyMeters, locationAt, locationProvider, ...safe } = telemetry;
   return safe;
 }
-function publishDevices() { broadcast({ type: "devices", devices: publicDevices() }, "R9RY506354P"); }
+function publishDevices() { sendToMasters({ type: "devices", devices: publicDevices() }); }
 function persistDeviceNames() {
   fs.mkdirSync(path.dirname(registryPath), { recursive: true });
   const names = Object.fromEntries([...devices.entries()].map(([id, device]) => [id, device.name]));
@@ -472,7 +688,7 @@ function enqueueCommand(deviceId, command, issuedBy) {
   console.log(`Command ${id} ${command} queued for ${deviceId} by ${issuedBy}.`);
   queue.push(entry);
   queues.set(deviceId, queue);
-  broadcast({ type: "commandQueued", command: entry }, "R9RY506354P");
+  sendToMasters({ type: "commandQueued", command: entry });
   drainQueue(deviceId);
   return entry;
 }
@@ -486,7 +702,7 @@ function drainQueue(deviceId) {
   database.prepare("UPDATE command_log SET status='sent',sent_at=? WHERE id=? AND status='pending'").run(active.sentAt, active.id);
   queueSupabaseCommand(active);
   send(socket, { type: "command", commandId: active.id, command: active.command, targetId: deviceId });
-  broadcast({ type: "commandUpdate", command: active }, "R9RY506354P");
+  sendToMasters({ type: "commandUpdate", command: active });
   active.timeout = setTimeout(() => acknowledge(active.id, false, "No acknowledgement before timeout."), 45_000);
 }
 function acknowledge(commandId, ok, detail, sourceDeviceId) {
@@ -502,7 +718,7 @@ function acknowledge(commandId, ok, detail, sourceDeviceId) {
   console.log(`Command ${commandId} ${entry.status}: ${detail || "no detail"}`);
   const queue = queues.get(entry.deviceId) || [];
   queues.set(entry.deviceId, queue.filter((queued) => queued.id !== commandId));
-  broadcast({ type: "commandUpdate", command: entry }, "R9RY506354P");
+  sendToMasters({ type: "commandUpdate", command: entry });
   drainQueue(entry.deviceId);
 }
 
@@ -618,9 +834,15 @@ setInterval(() => {
 setInterval(() => {
   if (latestTelemetry.online && latestTelemetry.receivedAt && Date.now() - Date.parse(latestTelemetry.receivedAt) > 10_000) {
     latestTelemetry = { ...latestTelemetry, detected: false, rssi: null, online: false };
-    broadcast({ type: "telemetry", ...latestTelemetry }, "R9RY506354P");
+    sendToMasters({ type: "telemetry", ...latestTelemetry });
   }
 }, 2000).unref();
+setInterval(() => {
+  const now = Date.now();
+  for (const client of adminSockets) {
+    if (Date.parse(client.adminSessionExpiresAt) <= now) client.close(4003, "Admin session expired");
+  }
+}, 30_000).unref();
 
 const shutdown = () => {
   for (const entry of commands.values()) clearTimeout(entry.timeout);
