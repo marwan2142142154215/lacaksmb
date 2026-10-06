@@ -429,17 +429,20 @@ async function buildSiteBoundTrackerApk(site, issuedBy) {
     let version = "";
     for (const candidate of fs.readdirSync(sdkBuildTools)) version = candidate;
     const zipalign = path.join(sdkBuildTools, version, "zipalign.exe");
-    const apksigner = path.join(sdkBuildTools, version, "apksigner.bat");
     const aligned = path.join(workDir, "aligned.apk");
     await runFile(zipalign, ["-f", "4", unsignedZip, aligned]);
 
     const debugKeystore = path.join(os.homedir(), ".android", "debug.keystore");
-    await new Promise((resolve, reject) => {
-      execFile("cmd.exe", ["/c", apksigner, "sign", "--ks", debugKeystore, "--ks-key-alias", "androiddebugkey", "--ks-pass", "pass:android", "--key-pass", "pass:android", aligned], (error, stdout, stderr) => {
-        if (error) reject(new Error(`apksigner gagal: ${stderr || stdout || error.message}`));
-        else resolve();
-      });
-    });
+    const jdkHome = process.env.JAVA_HOME && fs.existsSync(process.env.JAVA_HOME)
+      ? process.env.JAVA_HOME
+      : path.join(process.env["ProgramFiles"] || "C:\\Program Files", "Android", "Android Studio", "jbr");
+    const javaExe = path.join(jdkHome, "bin", "java.exe");
+    const apksignerJar = path.join(sdkBuildTools, version, "lib", "apksigner.jar");
+    try {
+      await runFile(javaExe, ["-jar", apksignerJar, "sign", "--ks", debugKeystore, "--ks-key-alias", "androiddebugkey", "--ks-pass", "pass:android", "--key-pass", "pass:android", aligned]);
+    } catch (error) {
+      throw new Error(`apksigner gagal: ${error.stderr || error.stdout || error.message}`);
+    }
 
     const downloadName = `SMB-Lacak-${site.name.replace(/[^\w-]+/g, "-")}.apk`;
     return { apkPath: aligned, downloadName };
@@ -533,7 +536,7 @@ const server = https.createServer({
   ]);
   if (allowedOrigins.has(origin)) {
     response.setHeader("access-control-allow-origin", origin);
-    response.setHeader("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
+    response.setHeader("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
     response.setHeader("access-control-allow-headers", "Authorization,Content-Type");
     response.setHeader("vary", "Origin");
   }
