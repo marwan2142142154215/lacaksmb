@@ -217,8 +217,7 @@ const server = https.createServer({
   if (request.method === "OPTIONS") { response.writeHead(204); response.end(); return; }
   if (request.url === "/health") {
     response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-    const recentCommands = [...commands.values()].slice(-10).map(({ id, deviceId, command, issuedBy, status, createdAt, completedAt, detail }) => ({ id, deviceId, command, issuedBy, status, createdAt, completedAt, detail }));
-    response.end(JSON.stringify({ ok: true, service: "smb-fleet-broker", devices: publicDevices(false), telemetry: publicTelemetry(latestTelemetry, false), recentCommands }));
+    response.end(JSON.stringify({ ok: true, service: "smb-fleet-broker" }));
     return;
   }
   if (request.method === "POST" && request.url === "/api/auth/login") {

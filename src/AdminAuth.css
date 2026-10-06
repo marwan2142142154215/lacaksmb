@@ -112,6 +112,31 @@
   line-height: 1.6;
 }
 .smb-auth-step { margin: 0 0 14px !important; }
+.smb-totp-qr {
+  display: block;
+  width: 220px;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto 14px;
+  padding: 9px;
+  border: 1px solid var(--auth-line);
+  border-radius: 12px;
+  background: #fff;
+}
+.smb-totp-qr-loading {
+  display: grid;
+  width: 220px;
+  max-width: 100%;
+  aspect-ratio: 1;
+  margin: 0 auto 14px;
+  place-items: center;
+  border: 1px solid var(--auth-line);
+  border-radius: 12px;
+  color: var(--auth-muted);
+  background: #fbfcfc;
+  font-size: 11px;
+}
+.smb-auth-fallback { margin: 0 0 8px !important; font-size: 11px !important; }
 .smb-totp-secret {
   display: block;
   overflow-wrap: anywhere;
